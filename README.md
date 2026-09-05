@@ -10,6 +10,7 @@ local UserInputService = game:GetService("UserInputService")
 local StarterGui = game:GetService("StarterGui")
 local Workspace = game:GetService("Workspace")
 local StarterPlayer = game:GetService("StarterPlayer")
+local ProximityPromptService = game:GetService("ProximityPromptService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 
 local LocalPlayer = Players.LocalPlayer
@@ -39,6 +40,7 @@ local InterfaceManager = LoadURL("https://raw.githubusercontent.com/dawid-script
 local CraftConfig
 local LeaderboardConfig
 local FishingConfig
+local FoodConfig
 
 pcall(function()
     CraftConfig = require(ReplicatedStorage:WaitForChild("CraftConfig"))
@@ -50,6 +52,10 @@ end)
 
 pcall(function()
     FishingConfig = require(ReplicatedStorage:WaitForChild("FishingConfig"))
+end)
+
+pcall(function()
+    FoodConfig = require(ReplicatedStorage:WaitForChild("FoodConfig"))
 end)
 
 --// Remotes
@@ -71,6 +77,12 @@ local FishingAction = FishingRemotes and FishingRemotes:FindFirstChild("FishingA
 local FishingState = FishingRemotes and FishingRemotes:FindFirstChild("FishingState")
 local FishingHoldInput = FishingRemotes and FishingRemotes:FindFirstChild("HoldInput")
 local FishingShopAction = FishingRemotes and FishingRemotes:FindFirstChild("ShopAction")
+
+--// Supermarket
+local SuperMarketEvent = ReplicatedStorage:FindFirstChild("SuperMarketEvent")
+local SuperMarketConfirm =
+    SuperMarketEvent and
+    SuperMarketEvent:FindFirstChild("ConfirmEvent")
 
 --// Shop
 local BuyRemote = ReplicatedStorage:FindFirstChild("Buy")
@@ -120,7 +132,7 @@ local SellPosition = CFrame.new(-2087.526, -61.485, 3234.564)
 
 --// Fishing
 local FishingShopPosition = CFrame.new(-1627.63, -61.7, 3274)
-local FishingFallbackPosition = CFrame.new(-1504.5, -59, 3128.5)
+local FishingFarmPosition = CFrame.new(-1514, -75, 2822)
 
 --// Auto Farm Safe
 local SafeFarmCenter = Vector3.new(-2753, -31, 3991)
@@ -155,7 +167,14 @@ local State = {
     FishingAutoRunning = false,
     FishingFull = false,
     FishingFullAmount = 0,
+    FishingSellingParts = false,
     FishingBuying = false,
+    FishingBuyingRod = false,
+    FishingBaitRequestQueued = false,
+    FishingBaitRetryToken = 0,
+    FishingBaitConnection = nil,
+    FishingLastBaitAmount = nil,
+    FishingShopPromptCache = nil,
     FishingSelling = false,
     FishingHolding = false,
     FishingAutoToken = 0,
@@ -164,13 +183,36 @@ local State = {
     FishingPrevTick = nil,
     FishingIVelocity = 0,
     FishingGVelocity = 0,
+    FishingArrow = 0,
+    FishingArrowChanged = 0,
+    FishingTickEMA = 0.05,
+    FishingPendingHold = nil,
+    FishingPendingTicks = 0,
+    FishingLastHoldChange = 0,
+    FishingVisualWriting = false,
     FishingVisualBind = false,
     FishingIndicatorConn = nil,
     FishingGreenConn = nil,
     FishingVisibleConn = nil,
+    FishingAssistOverlay = nil,
+    FishingStaticGreen = nil,
+    FishingOriginalIndicatorVisible = nil,
+    FishingOriginalGreenVisible = nil,
+    FishingLowFXApplied = false,
+    FishingFXTable = nil,
+    FishingUITable = nil,
+    FishingFXOriginal = nil,
+    FishingUIOriginal = nil,
+    FishingConfigOriginal = nil,
+    ApplyFishingLowFX = nil,
+    RestoreFishingLowFX = nil,
+    FishingOriginalMinigamePosition = nil,
+    FishingOriginalMinigameAnchorPoint = nil,
     LastFishingStart = 0,
     LastFishingAutoOn = 0,
     LastBaitBuy = 0,
+    LastFishingRodBuy = 0,
+    LastFishingRodNotify = 0,
 
     CraftBusy = false,
     LastCraft = 0,
@@ -181,9 +223,30 @@ local State = {
     ESP = {},
     CharParts = {},
     NoclipParts = {},
+    ESPLoopToken = 0,
+    ESPPlayerAddedConnection = nil,
+    ESPPlayerRemovingConnection = nil,
 
     FlyVelocity = nil,
     FlyGyro = nil,
+    MovementConnection = nil,
+    NoclipConnection = nil,
+    UndergroundConnection = nil,
+    AutoFarmLoopToken = 0,
+    FishingLoopToken = 0,
+    CraftLoopToken = 0,
+
+    AntiVoidFolder = nil,
+    AntiVoidParts = {},
+    AntiVoidConnection = nil,
+    AntiVoidLastSafe = nil,
+    AntiVoidLastSafeTick = 0,
+    AntiVoidLastRescue = 0,
+
+    DeleteMapBusy = false,
+    DeleteMapToken = 0,
+    DeleteMapCache = nil,
+    DeletedMapItems = {},
 
     TPTool = nil,
 
@@ -330,16 +393,13 @@ local function GetFarmTool(Farm)
 end
 
 local function EnsureFarmTool(Farm)
+    -- มี Tool อยู่แล้วก็ใช้ต่อทันที (รองรับทั้งตัวปกติและ (P))
     local Tool = GetFarmTool(Farm)
     if Tool then
         return Tool
     end
 
-    if
-        State.BuyingFarmTool or
-        not BuyRemote or
-        not BuyRemote:IsA("RemoteFunction") then
-
+    if State.BuyingFarmTool then
         return nil
     end
 
@@ -348,37 +408,54 @@ local function EnsureFarmTool(Farm)
         return nil
     end
 
-    -- กัน Remote ซื้อรัวเมื่อเงินไม่พอ/ร้านปฏิเสธ
-    if os.clock() - State.LastFarmToolBuy < 2.5 then
+    -- หา Remote ใหม่ทุกครั้ง เผื่อยังไม่ replicate ตอนรัน script
+    local Remote =
+        ReplicatedStorage:FindFirstChild("Buy") or
+        BuyRemote
+
+    if not Remote or not Remote:IsA("RemoteFunction") then
+        if os.clock() - State.LastFarmToolNotify >= 4 then
+            State.LastFarmToolNotify = os.clock()
+            Notify("Auto Farm", "ไม่พบ Remote ซื้อของ ReplicatedStorage.Buy")
+        end
+        return nil
+    end
+
+    BuyRemote = Remote
+
+    -- กันยิงซื้อถี่เกินไป
+    if os.clock() - State.LastFarmToolBuy < 1.25 then
         return nil
     end
 
     State.BuyingFarmTool = true
     State.LastFarmToolBuy = os.clock()
 
+    -- สำคัญ: Remote ของเกมอาจซื้อสำเร็จแต่ return nil
+    -- จึงตัดสินผลจาก Tool ที่ replicate เข้ามาจริง ไม่ใช่ Result
     local Success, Result = pcall(function()
-        return BuyRemote:InvokeServer(BuyName)
+        return Remote:InvokeServer(BuyName)
     end)
 
-    if not Success or not Result then
+    if not Success then
         State.BuyingFarmTool = false
 
-        if os.clock() - State.LastFarmToolNotify >= 5 then
+        if os.clock() - State.LastFarmToolNotify >= 4 then
             State.LastFarmToolNotify = os.clock()
             Notify(
                 "Auto Farm",
-                "ไม่มี " .. BuyName .. " และซื้ออัตโนมัติไม่สำเร็จ"
+                "เรียกซื้อ " .. tostring(BuyName) .. " ไม่สำเร็จ"
             )
         end
 
         return nil
     end
 
-    -- รอ replication ของ Tool เข้า Backpack/Character แล้ว equip ต่อ
-    local Deadline = os.clock() + 2
+    -- ต่อให้ Result=nil ก็ยังรอ Tool เพราะ server อาจไม่ return ค่า
+    local Deadline = os.clock() + 4
 
     repeat
-        task.wait(0.1)
+        task.wait(0.08)
         Tool = GetFarmTool(Farm)
     until Tool or os.clock() >= Deadline
 
@@ -387,17 +464,34 @@ local function EnsureFarmTool(Farm)
     if Tool then
         Notify(
             "Auto Farm",
-            "ซื้อ " .. BuyName .. " สำเร็จ → เริ่มฟาร์มต่อ"
+            "ซื้อ " .. tostring(BuyName) .. " สำเร็จ → เริ่มฟาร์ม"
         )
-    elseif os.clock() - State.LastFarmToolNotify >= 5 then
-        State.LastFarmToolNotify = os.clock()
-        Notify(
-            "Auto Farm",
-            "ซื้อ " .. BuyName .. " แล้ว แต่ยังไม่พบ Tool"
+        return Tool
+    end
+
+    -- ถ้า server ตอบ table ที่มีข้อความ ให้เอามาแจ้งด้วย
+    local Message = ""
+    if type(Result) == "table" then
+        Message = tostring(
+            Result.message or
+            Result.reason or
+            Result.error or
+            ""
         )
     end
 
-    return Tool
+    if os.clock() - State.LastFarmToolNotify >= 4 then
+        State.LastFarmToolNotify = os.clock()
+        Notify(
+            "Auto Farm",
+            "ยังไม่พบ " ..
+            tostring(BuyName) ..
+            " หลังสั่งซื้อ" ..
+            (Message ~= "" and (" : " .. Message) or "")
+        )
+    end
+
+    return nil
 end
 
 local function NormalM1(Tool)
@@ -1014,66 +1108,103 @@ if AutoFarmState then
     end)
 end
 
---// Underground Y Controller
-Connect(RunService.Heartbeat, function()
-    if
-        Options.UndergroundFarm.Value and
-        Options.AutoFarm.Value and
-        not State.Selling and
-        not State.SafeActive then
-
-        StartUndergroundFarm()
-    elseif State.UndergroundActive or State.UndergroundForce then
-        StopUndergroundFarm()
+--// Auto Farm runtime - no loop at startup
+local function StopUndergroundRuntime()
+    if State.UndergroundConnection then
+        pcall(function()
+            State.UndergroundConnection:Disconnect()
+        end)
+        State.UndergroundConnection = nil
     end
-end)
 
-UndergroundFarmToggle:OnChanged(function()
-    if Options.UndergroundFarm.Value then
-        if Options.AutoFarm.Value and not State.Selling and not State.SafeActive then
-            StartUndergroundFarm()
+    StopUndergroundFarm()
+end
+
+local function UpdateUndergroundRuntime()
+    if
+        Options.AutoFarm.Value and
+        Options.UndergroundFarm.Value then
+
+        if not State.UndergroundConnection then
+            State.UndergroundConnection =
+                RunService.Heartbeat:Connect(function()
+                    if
+                        not State.Alive or
+                        not Options.AutoFarm.Value or
+                        not Options.UndergroundFarm.Value then
+
+                        return
+                    end
+
+                    if
+                        not State.Selling and
+                        not State.SafeActive then
+
+                        StartUndergroundFarm()
+                    elseif
+                        State.UndergroundActive or
+                        State.UndergroundForce then
+
+                        StopUndergroundFarm()
+                    end
+                end)
         end
     else
-        StopUndergroundFarm()
+        StopUndergroundRuntime()
     end
-end)
+end
 
---// Recovery / Full-stack watcher
-task.spawn(function()
-    while State.Alive do
-        if Options.AutoFarm.Value and not State.Selling then
-            local FarmId = Options.FarmType.Value or "Banana"
-            local Farm = Farms[FarmId]
+local function StartAutoFarmWatcher()
+    State.AutoFarmLoopToken += 1
+    local Token = State.AutoFarmLoopToken
 
-            if Farm then
-                -- Auto Sell มีสิทธิ์ก่อน Safe เพื่อไม่ให้ของเต็มค้าง
-                if Options.AutoSellFull.Value and IsFull(Farm) then
-                    SellFarmMaterial(Farm)
+    task.spawn(function()
+        while
+            State.Alive and
+            Options.AutoFarm.Value and
+            Token == State.AutoFarmLoopToken do
 
-                elseif
-                    FarmId == "Banana" and
-                    Options.AutoFarmSafe.Value and
-                    HasFarmThreat() then
+            if not State.Selling then
+                local FarmId = Options.FarmType.Value or "Banana"
+                local Farm = Farms[FarmId]
 
-                    EnterSafeZone()
+                if Farm then
+                    if Options.AutoSellFull.Value and IsFull(Farm) then
+                        SellFarmMaterial(Farm)
+                    elseif
+                        FarmId == "Banana" and
+                        Options.AutoFarmSafe.Value and
+                        HasFarmThreat() then
 
-                elseif State.SafeActive then
-                    LeaveSafeZone()
-                    task.wait(0.2)
-                    StartGameFarm()
+                        EnterSafeZone()
+                    elseif State.SafeActive then
+                        LeaveSafeZone()
+                        task.wait(0.2)
+                        StartGameFarm()
+                    elseif
+                        not State.GameFarmRunning and
+                        not State.BuyingFarmTool then
 
-                elseif not State.GameFarmRunning then
-                    StartGameFarm()
+                        StartGameFarm()
+                    end
                 end
             end
-        end
 
-        task.wait(0.25)
-    end
+            task.wait(0.3)
+        end
+    end)
+end
+
+UndergroundFarmToggle:OnChanged(function()
+    UpdateUndergroundRuntime()
 end)
 
 AutoFarmToggle:OnChanged(function()
+    State.AutoFarmLoopToken += 1
+    UpdateUndergroundRuntime()
+
     if Options.AutoFarm.Value then
+        StartAutoFarmWatcher()
         if Options.AutoFishing and Options.AutoFishing.Value then
             pcall(function()
                 Options.AutoFishing:SetValue(false)
@@ -1239,13 +1370,19 @@ Tabs.Main:AddToggle("FishingGameAutoAfterE", {
 
 Tabs.Main:AddToggle("FishingMinigameAssist", {
     Title = "Minigame Assist",
-    Description = "ล็อกขีด GUI ไว้กลาง Green Zone + คุม HoldInput อัตโนมัติ",
+    Description = "อ่านตำแหน่งจริงจาก server + คุม HoldInput อัตโนมัติ",
+    Default = true
+})
+
+Tabs.Main:AddToggle("FishingLowFX", {
+    Title = "Low FX Fishing",
+    Description = "ปิดเอฟเฟกต์ตกปลาหนัก ๆ เพื่อลด FPS drop โดยเฉพาะ Legendary/Mythic",
     Default = true
 })
 
 Tabs.Main:AddToggle("FishingAutoTP", {
     Title = "Auto TP Fishing Zone",
-    Description = "วาปเข้า Fishing Zone ก่อนเริ่มอัตโนมัติ",
+    Description = "วาปไปจุดฟาร์ม -1514, -75, 2822 ก่อนเริ่มอัตโนมัติ",
     Default = true
 })
 
@@ -1253,6 +1390,12 @@ Tabs.Main:AddToggle("FishingAutoBuyBait", {
     Title = "Auto Buy Bait",
     Description = "ซื้อแพ็กเหยื่อที่เลือกเมื่อเหยื่อเหลือน้อย",
     Default = false
+})
+
+Tabs.Main:AddToggle("FishingAutoSellFull", {
+    Title = "Auto Sell Fish When Full",
+    Description = "FishPart เต็ม 150/150 → ไปตลาดขาย → กลับมาตกต่อ",
+    Default = true
 })
 
 Tabs.Main:AddSlider("FishingBaitThreshold", {
@@ -1270,53 +1413,403 @@ local function GetFishingBait()
     return Bait and tonumber(Bait.Value) or 0
 end
 
-local function GetFishingMaterialAmount()
-    local Id =
+local function GetFishingMaterialId()
+    return
         FishingConfig and
         FishingConfig.AutoFarm and
         FishingConfig.AutoFarm.MaterialId or
         "FishPart"
+end
 
-    return GetAmount(Id)
+local function GetFishingMaterialAmount()
+    return GetAmount(GetFishingMaterialId())
+end
+
+local function GetFishingMaterialMax()
+    local Id = GetFishingMaterialId()
+    local Object = GetMaterialObject(Id)
+
+    if Object then
+        local Max = tonumber(Object:GetAttribute("MaxStack"))
+        if Max and Max > 0 then
+            return Max
+        end
+    end
+
+    if CraftConfig and type(CraftConfig.Materials) == "table" then
+        for _, Material in ipairs(CraftConfig.Materials) do
+            if Material.Id == Id and tonumber(Material.MaxStack) then
+                return tonumber(Material.MaxStack)
+            end
+        end
+    end
+
+    return 150
+end
+
+local function IsFishingMaterialFull()
+    return GetFishingMaterialAmount() >= GetFishingMaterialMax()
 end
 
 local function SelectedFishingRod()
     return FishingRodMap[Options.FishingRod.Value]
 end
 
-local function GetFishingRodTool()
+local function GetSelectedRodToolName()
     local Rod = SelectedFishingRod()
-    if not Rod then return nil end
 
-    local Char = Character()
-    local Backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
-    local ToolName = Rod.ToolName
-
-    local Tool = Char and Char:FindFirstChild(ToolName)
-
-    if not Tool and Backpack then
-        Tool = Backpack:FindFirstChild(ToolName)
+    if Rod and Rod.ToolName then
+        return tostring(Rod.ToolName)
     end
 
-    return Tool
+    return "Fishing Rod"
+end
+
+local function GetFishingRodTool()
+    local ToolName = GetSelectedRodToolName()
+    local Char = Character()
+    local Backpack = LocalPlayer:FindFirstChild("Backpack")
+
+    -- pathway ตรงตามของในเกม:
+    -- LocalPlayer.Backpack["Fishing Rod"]
+    -- LocalPlayer.Backpack["VIP Fishing Rod"]
+    local Tool =
+        Char and
+        Char:FindFirstChild(ToolName)
+
+    if Tool and Tool:IsA("Tool") then
+        return Tool
+    end
+
+    Tool =
+        Backpack and
+        Backpack:FindFirstChild(ToolName)
+
+    if Tool and Tool:IsA("Tool") then
+        return Tool
+    end
+
+    return nil
+end
+
+local function IsFishingRodEquipped()
+    local Char = Character()
+    if not Char then return false end
+
+    local ToolName = GetSelectedRodToolName()
+    local Tool = Char:FindFirstChild(ToolName)
+
+    return Tool and Tool:IsA("Tool") or false
 end
 
 local function EquipFishingRod()
-    local Tool = GetFishingRodTool()
+    local Char = Character()
+    local Hum = Humanoid()
+    local Backpack = LocalPlayer:FindFirstChild("Backpack")
 
-    if not Tool then
+    if
+        not Char or
+        not Hum or
+        Hum.Health <= 0 or
+        not Backpack then
+
         return false
     end
 
-    local Char = Character()
-    local Hum = Humanoid()
+    local ToolName = GetSelectedRodToolName()
 
-    if Char and Tool.Parent ~= Char and Hum then
+    -- ถืออยู่แล้ว
+    if IsFishingRodEquipped() then
+        return true
+    end
+
+    -- รอ Tool ตรง pathway ใน Backpack หลังซื้อ
+    local Tool =
+        Backpack:FindFirstChild(ToolName)
+
+    local Deadline = os.clock() + 3
+
+    while
+        not Tool and
+        os.clock() < Deadline do
+
+        task.wait(0.05)
+
+        Backpack =
+            LocalPlayer:FindFirstChild("Backpack")
+
+        Tool =
+            Backpack and
+            Backpack:FindFirstChild(ToolName)
+
+        if IsFishingRodEquipped() then
+            return true
+        end
+    end
+
+    if not Tool or not Tool:IsA("Tool") then
+        return false
+    end
+
+    -- ปลดของที่ถืออยู่ก่อน
+    pcall(function()
+        Hum:UnequipTools()
+    end)
+
+    task.wait(0.08)
+
+    -- รอบ 1: Roblox API ปกติ
+    pcall(function()
         Hum:EquipTool(Tool)
+    end)
+
+    for _ = 1, 5 do
+        task.wait(0.08)
+
+        if IsFishingRodEquipped() then
+            return true
+        end
+
+        Backpack =
+            LocalPlayer:FindFirstChild("Backpack")
+
+        Tool =
+            Backpack and
+            Backpack:FindFirstChild(ToolName)
+
+        if Tool and Tool:IsA("Tool") then
+            pcall(function()
+                Hum:EquipTool(Tool)
+            end)
+        end
+    end
+
+    -- รอบ 2: pathway ตรง ๆ
+    -- ถ้า EquipTool ไม่ย้าย Tool ให้ย้ายจาก Backpack -> Character
+    Backpack =
+        LocalPlayer:FindFirstChild("Backpack")
+
+    Tool =
+        Backpack and
+        Backpack:FindFirstChild(ToolName)
+
+    if Tool and Tool:IsA("Tool") then
+        pcall(function()
+            Tool.Parent = Char
+        end)
+
+        task.wait(0.12)
+
+        if IsFishingRodEquipped() then
+            return true
+        end
+
+        -- สั่ง Humanoid ซ้ำหลังย้ายเข้า Character
+        pcall(function()
+            Hum:EquipTool(Tool)
+        end)
+
         task.wait(0.15)
     end
 
-    return Tool.Parent == Char
+    return IsFishingRodEquipped()
+end
+
+local function GetFishingShopPrompt()
+    local Cached = State.FishingShopPromptCache
+
+    if Cached and Cached.Parent then
+        return Cached
+    end
+
+    -- scan แค่ครั้งแรกที่ต้องซื้อคันเบ็ด แล้ว cache ไว้
+    for _, Object in ipairs(Workspace:GetDescendants()) do
+        if
+            Object:IsA("ProximityPrompt") and
+            Object.Name == "ShopPrompt" then
+
+            State.FishingShopPromptCache = Object
+            return Object
+        end
+    end
+
+    return nil
+end
+
+local function GetPromptCFrame(Prompt)
+    if not Prompt then return nil end
+
+    local Parent = Prompt.Parent
+
+    if Parent and Parent:IsA("BasePart") then
+        return Parent.CFrame
+    end
+
+    if Parent and Parent:IsA("Attachment") then
+        local Part = Parent.Parent
+        if Part and Part:IsA("BasePart") then
+            return Part.CFrame
+        end
+    end
+
+    if Parent and Parent:IsA("Model") then
+        return Parent:GetPivot()
+    end
+
+    local Part =
+        Parent and
+        Parent:FindFirstChildWhichIsA("BasePart", true)
+
+    return Part and Part.CFrame or nil
+end
+
+local function EnsureFishingRod()
+    local Tool = GetFishingRodTool()
+    if Tool then
+        return EquipFishingRod()
+    end
+
+    if State.FishingBuyingRod then
+        return false
+    end
+
+    local Rod = SelectedFishingRod()
+    if not Rod then
+        return false
+    end
+
+    local Remote =
+        FishingRemotes and
+        FishingRemotes:FindFirstChild("ShopAction")
+
+    if
+        not Remote or
+        not Remote:IsA("RemoteFunction") then
+
+        if os.clock() - State.LastFishingRodNotify >= 4 then
+            State.LastFishingRodNotify = os.clock()
+            Notify("Auto Fishing", "ไม่พบ Fishing ShopAction")
+        end
+
+        return false
+    end
+
+    FishingShopAction = Remote
+
+    -- กัน Auto Fishing ยิงซื้อซ้ำทุก watcher tick
+    if os.clock() - State.LastFishingRodBuy < 2 then
+        return false
+    end
+
+    State.FishingBuyingRod = true
+    State.LastFishingRodBuy = os.clock()
+
+    local HRP = Root()
+    local ReturnCF = HRP and HRP.CFrame or nil
+
+    -- ไปหน้าร้านจริงก่อน เผื่อ server เช็กระยะ
+    local Prompt = GetFishingShopPrompt()
+    local ShopCF = GetPromptCFrame(Prompt)
+
+    if ShopCF then
+        Teleport(ShopCF * CFrame.new(0, 0, -2.5))
+    else
+        Teleport(FishingShopPosition)
+    end
+
+    task.wait(0.15)
+
+    -- Trigger prompt ให้ flow ใกล้กับการซื้อจาก UI จริง
+    if Prompt and fireproximityprompt then
+        pcall(function()
+            fireproximityprompt(Prompt)
+        end)
+        task.wait(0.12)
+    end
+
+    local Success, Result = pcall(function()
+        return Remote:InvokeServer("buyRod", Rod.Id)
+    end)
+
+    -- อย่าตัดสินจาก Result=nil อย่างเดียว
+    -- รอ Tool จริงเข้า Backpack/Character
+    local Deadline = os.clock() + 4
+
+    repeat
+        task.wait(0.08)
+        Tool = GetFishingRodTool()
+    until Tool or os.clock() >= Deadline
+
+    State.FishingBuyingRod = false
+
+    if Tool then
+        -- รอให้คันเบ็ดอยู่ใน Backpack/Character จริงก่อน
+        local ToolName = GetSelectedRodToolName()
+        local WaitUntil = os.clock() + 2
+
+        repeat
+            local Backpack = LocalPlayer:FindFirstChild("Backpack")
+            Tool =
+                (Character() and Character():FindFirstChild(ToolName)) or
+                (Backpack and Backpack:FindFirstChild(ToolName))
+
+            if Tool then break end
+            task.wait(0.05)
+        until os.clock() >= WaitUntil
+
+        -- กลับจุดฟาร์มก่อน แล้วบังคับถือจาก pathway ตรง
+        Teleport(FishingFarmPosition)
+        task.wait(0.2)
+
+        if EquipFishingRod() then
+            Notify(
+                "Auto Fishing",
+                "ซื้อ " ..
+                tostring(Rod.ToolName or Rod.DisplayName or Rod.Id) ..
+                " สำเร็จ → ถือคันเบ็ดแล้ว"
+            )
+
+            return true
+        end
+    end
+
+    -- ถ้าซื้อไม่สำเร็จ กลับจุดเดิม/จุดฟาร์ม
+    if ReturnCF then
+        Teleport(ReturnCF)
+    else
+        Teleport(FishingFarmPosition)
+    end
+
+    if os.clock() - State.LastFishingRodNotify >= 4 then
+        State.LastFishingRodNotify = os.clock()
+
+        local Message = ""
+
+        if type(Result) == "table" then
+            Message = tostring(
+                Result.message or
+                Result.reason or
+                Result.error or
+                ""
+            )
+        end
+
+        if not Success then
+            Message =
+                Message ~= "" and Message or
+                "Remote error"
+        end
+
+        Notify(
+            "Auto Fishing",
+            "ซื้อ " ..
+            tostring(Rod.ToolName or Rod.DisplayName or Rod.Id) ..
+            " ไม่สำเร็จ" ..
+            (Message ~= "" and (" : " .. Message) or "")
+        )
+    end
+
+    return false
 end
 
 local function IsInsideFishingZone(Position)
@@ -1344,111 +1837,354 @@ local function IsInsideFishingZone(Position)
 end
 
 local function GetFishingZoneCFrame()
-    local Folder = Workspace:FindFirstChild("FishingZones")
-    local HRP = Root()
+    -- จุดฟาร์มตกปลาที่กำหนดเอง
+    return FishingFarmPosition
+end
 
-    if not Folder then
-        return FishingFallbackPosition
+local function GetFishingBaitObject()
+    local Folder = LocalPlayer:FindFirstChild("Fishing")
+    local Bait = Folder and Folder:FindFirstChild("Bait")
+
+    if
+        Bait and
+        (
+            Bait:IsA("IntValue") or
+            Bait:IsA("NumberValue")
+        ) then
+
+        return Bait
     end
 
-    local Best
-    local BestDistance = math.huge
-
-    for _, Zone in ipairs(Folder:GetChildren()) do
-        if Zone:IsA("BasePart") then
-            local Distance =
-                HRP and
-                (HRP.Position - Zone.Position).Magnitude or
-                0
-
-            if Distance < BestDistance then
-                Best = Zone
-                BestDistance = Distance
-            end
-        end
-    end
-
-    if not Best then
-        return FishingFallbackPosition
-    end
-
-    -- อยู่ใน volume ของ Fishing Zone แต่ใกล้ขอบบน ไม่ลงลึกเกินไป
-    return Best.CFrame * CFrame.new(
-        0,
-        math.max(0, Best.Size.Y * 0.5 - 2),
-        0
-    )
+    return nil
 end
 
 local function BuyFishingBait(Silent)
+    if State.FishingBuying then
+        return false
+    end
+
+    local Remote =
+        FishingRemotes and
+        FishingRemotes:FindFirstChild("ShopAction")
+
     if
-        State.FishingBuying or
-        not FishingShopAction or
-        not FishingShopAction:IsA("RemoteFunction") then
+        not Remote or
+        not Remote:IsA("RemoteFunction") then
 
         return false
     end
 
-    if os.clock() - State.LastBaitBuy < 2 then
+    FishingShopAction = Remote
+
+    -- Manual/forced buy ก็ยังมี debounce กัน double click
+    if os.clock() - State.LastBaitBuy < 1.5 then
         return false
     end
 
-    local Amount = FishingBaitMap[Options.FishingBaitPack.Value]
-    if not Amount then return false end
+    local Amount =
+        FishingBaitMap[
+            Options.FishingBaitPack.Value
+        ]
+
+    if not Amount then
+        return false
+    end
 
     State.FishingBuying = true
     State.LastBaitBuy = os.clock()
 
-    local Success, Result = pcall(function()
-        return FishingShopAction:InvokeServer("buyBait", Amount)
-    end)
+    local Before = GetFishingBait()
+
+    local Success, Result =
+        pcall(function()
+            return Remote:InvokeServer(
+                "buyBait",
+                Amount
+            )
+        end)
+
+    -- ไม่รอ Result อย่างเดียว
+    -- รอ Bait.Value replication จริง แต่สูงสุดสั้น ๆ
+    local Changed = false
+    local Deadline = os.clock() + 1.5
+
+    if Success then
+        repeat
+            task.wait(0.05)
+
+            if GetFishingBait() > Before then
+                Changed = true
+                break
+            end
+        until os.clock() >= Deadline
+    end
 
     State.FishingBuying = false
 
     local OK =
-        Success and
-        type(Result) == "table" and
-        Result.ok == true
+        Changed or
+        (
+            Success and
+            type(Result) == "table" and
+            Result.ok == true
+        )
 
     if not Silent then
+        local Message
+
+        if OK then
+            Message =
+                type(Result) == "table" and
+                Result.message or
+                (
+                    "ซื้อเหยื่อ x" ..
+                    tostring(Amount) ..
+                    " สำเร็จ"
+                )
+        else
+            Message =
+                type(Result) == "table" and
+                (
+                    Result.message or
+                    Result.reason
+                ) or
+                "ซื้อเหยื่อไม่สำเร็จ"
+        end
+
         Notify(
             "Fishing Bait",
-            OK
-                and (Result.message or ("ซื้อเหยื่อ x" .. Amount .. " สำเร็จ"))
-                or (
-                    type(Result) == "table" and
-                    Result.message or
-                    "ซื้อเหยื่อไม่สำเร็จ"
-                )
+            tostring(Message)
         )
     end
 
     return OK
 end
 
-local function BuyFishingRod()
-    local Rod = SelectedFishingRod()
+local StartAutoFishing
+local QueueAutoBuyBait
 
+QueueAutoBuyBait = function(RestartFishing, Force)
     if
-        not Rod or
-        not FishingShopAction or
-        not FishingShopAction:IsA("RemoteFunction") then
+        not State.Alive or
+        not Options.FishingAutoBuyBait.Value or
+        State.FishingBaitRequestQueued or
+        State.FishingBuying then
 
-        Notify("Fishing", "ไม่พบ ShopAction")
         return
     end
 
-    local Success, Result = pcall(function()
-        return FishingShopAction:InvokeServer("buyRod", Rod.Id)
-    end)
+    local Current = GetFishingBait()
+    local Threshold =
+        tonumber(
+            Options.FishingBaitThreshold.Value
+        ) or 5
 
-    Notify(
-        "Fishing Rod",
-        Success and
-        type(Result) == "table" and
-        (Result.message or (Result.ok and "ซื้อสำเร็จ" or "ซื้อไม่สำเร็จ")) or
-        "ซื้อคันเบ็ดไม่สำเร็จ"
-    )
+    if not Force and Current > Threshold then
+        return
+    end
+
+    -- Auto buy มี cooldown ยาวกว่า manual
+    -- ป้องกัน RemoteFunction spam / lag spike
+    if
+        not Force and
+        os.clock() - State.LastBaitBuy < 8 then
+
+        return
+    end
+
+    State.FishingBaitRequestQueued = true
+    State.FishingBaitRetryToken += 1
+
+    local Token = State.FishingBaitRetryToken
+
+    task.spawn(function()
+        -- ให้ fishing state/event จบรอบปัจจุบันก่อน
+        task.wait(0.08)
+
+        if
+            not State.Alive or
+            Token ~= State.FishingBaitRetryToken or
+            not Options.FishingAutoBuyBait.Value then
+
+            State.FishingBaitRequestQueued = false
+            return
+        end
+
+        local Before = GetFishingBait()
+        local OK = BuyFishingBait(true)
+        local After = GetFishingBait()
+
+        State.FishingBaitRequestQueued = false
+
+        if OK and After > Before then
+            -- ถ้าเคยหยุดเพราะเหยื่อหมด เริ่มตกต่อ
+            if
+                RestartFishing and
+                Options.AutoFishing.Value and
+                After > 0 then
+
+                task.delay(0.18, function()
+                    if
+                        State.Alive and
+                        Options.AutoFishing.Value and
+                        not State.FishingBuying then
+
+                        StartAutoFishing()
+                    end
+                end)
+            end
+
+            return
+        end
+
+        -- ซื้อไม่ผ่าน: ไม่ยิง Remote ซ้ำทุก watcher tick
+        -- รอ 10 วิแล้วค่อยลองใหม่ ถ้ายังต่ำจริง
+        task.delay(10, function()
+            if
+                not State.Alive or
+                Token ~= State.FishingBaitRetryToken or
+                not Options.FishingAutoBuyBait.Value then
+
+                return
+            end
+
+            local AmountNow = GetFishingBait()
+
+            if
+                AmountNow <=
+                (
+                    tonumber(
+                        Options.FishingBaitThreshold.Value
+                    ) or 5
+                ) then
+
+                QueueAutoBuyBait(
+                    AmountNow <= 0,
+                    false
+                )
+            end
+        end)
+    end)
+end
+
+local function DisconnectAutoBaitConnection()
+    if State.FishingBaitConnection then
+        pcall(function()
+            State.FishingBaitConnection:Disconnect()
+        end)
+
+        State.FishingBaitConnection = nil
+    end
+
+    State.FishingBaitRetryToken += 1
+    State.FishingBaitRequestQueued = false
+end
+
+local function BindAutoBaitConnection()
+    DisconnectAutoBaitConnection()
+
+    if not Options.FishingAutoBuyBait.Value then
+        return
+    end
+
+    local Bait = GetFishingBaitObject()
+
+    if not Bait then
+        return
+    end
+
+    State.FishingLastBaitAmount =
+        tonumber(Bait.Value) or 0
+
+    State.FishingBaitConnection =
+        Bait:GetPropertyChangedSignal("Value"):
+        Connect(function()
+
+            local Current =
+                tonumber(Bait.Value) or 0
+
+            local Previous =
+                State.FishingLastBaitAmount
+
+            State.FishingLastBaitAmount =
+                Current
+
+            if
+                not Options.FishingAutoBuyBait.Value or
+                not Options.AutoFishing.Value then
+
+                return
+            end
+
+            local Threshold =
+                tonumber(
+                    Options.FishingBaitThreshold.Value
+                ) or 5
+
+            -- Trigger เฉพาะตอนจำนวนลดลงจนถึง threshold
+            -- ไม่ polling Remote ซ้ำ ๆ
+            if
+                Current <= Threshold and
+                (
+                    Previous == nil or
+                    Previous > Threshold or
+                    Current <= 0
+                ) then
+
+                QueueAutoBuyBait(
+                    Current <= 0,
+                    false
+                )
+            end
+        end)
+
+    -- เปิด toggle ตอนเหยื่อต่ำอยู่แล้ว ให้ซื้อ 1 รอบ
+    if
+        State.FishingLastBaitAmount <=
+        (
+            tonumber(
+                Options.FishingBaitThreshold.Value
+            ) or 5
+        ) then
+
+        QueueAutoBuyBait(
+            State.FishingLastBaitAmount <= 0,
+            false
+        )
+    end
+end
+
+Options.FishingAutoBuyBait:OnChanged(function()
+    if Options.FishingAutoBuyBait.Value then
+        BindAutoBaitConnection()
+    else
+        DisconnectAutoBaitConnection()
+    end
+end)
+
+local function BuyFishingRod()
+    local Rod = SelectedFishingRod()
+
+    if not Rod then
+        Notify("Fishing Rod", "ไม่ได้เลือกคันเบ็ด")
+        return
+    end
+
+    if GetFishingRodTool() then
+        Notify(
+            "Fishing Rod",
+            tostring(Rod.ToolName or Rod.DisplayName or Rod.Id) ..
+            " มีอยู่แล้ว"
+        )
+        return
+    end
+
+    task.spawn(function()
+        if not EnsureFishingRod() then
+            -- EnsureFishingRod แจ้งเหตุผลเองแล้ว
+            return
+        end
+    end)
 end
 
 local function SellAllFish()
@@ -1481,16 +2217,26 @@ local function SellAllFish()
     return OK
 end
 
-local StartAutoFishing
-
-local function SetFishingHold(Value)
+local function SetFishingHold(Value, Force)
     Value = Value == true
 
     if State.FishingHolding == Value then
         return
     end
 
+    local Now = os.clock()
+
+    -- กันสลับ Remote true/false ถี่เกินจาก jitter
+    -- Force ใช้เฉพาะตอนใกล้หลุดขอบจริง
+    if
+        not Force and
+        Now - (State.FishingLastHoldChange or 0) < 0.045 then
+
+        return
+    end
+
     State.FishingHolding = Value
+    State.FishingLastHoldChange = Now
 
     if FishingHoldInput then
         pcall(function()
@@ -1531,8 +2277,6 @@ local function TryGameAutoAfterCast()
     end)
 end
 
-local FISHING_VISUAL_BIND = "RCA_FishingInstantGreen"
-
 local function GetFishingMinigameObjects()
     local PlayerGui = LocalPlayer:FindFirstChild("PlayerGui")
     local Gui = PlayerGui and PlayerGui:FindFirstChild("FishingGui")
@@ -1542,146 +2286,395 @@ local function GetFishingMinigameObjects()
     local Indicator = Track and Track:FindFirstChild("Indicator")
     local GreenZone = Track and Track:FindFirstChild("GreenZone")
 
-    return Indicator, GreenZone, Minigame
+    return Indicator, GreenZone, Minigame, Track
 end
 
-local function ForceFishingIndicatorToGreen()
-    if
-        not Options.FishingMinigameAssist.Value then
+local function ClearOldFishingVisualsOnce()
+    local PlayerGui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not PlayerGui then return end
 
-        return
+    -- FindFirstChild recursive แค่ชื่อที่รู้จัก
+    -- ไม่ GetDescendants ทุกครั้งที่ bite
+    for _, Name in ipairs({
+        "RCA_StaticGreenZone",
+        "RCA_StaticIndicator",
+        "RCA_AssistIndicator"
+    }) do
+        while true do
+            local Object =
+                PlayerGui:FindFirstChild(
+                    Name,
+                    true
+                )
+
+            if not Object then
+                break
+            end
+
+            pcall(function()
+                Object:Destroy()
+            end)
+        end
     end
 
-    local Indicator, GreenZone, Minigame =
+    local Indicator, GreenZone =
         GetFishingMinigameObjects()
 
-    if
-        not Indicator or
-        not GreenZone or
-        not Minigame or
-        not Minigame.Visible then
-
-        return
-    end
-
-    -- Indicator/GreenZone เป็น Frame ใต้ Track เดียวกัน
-    -- และ AnchorPoint เดียวกัน 0.5,0.5
-    -- จึงย้าย Indicator ไปทับจุดกึ่งกลาง GreenZone โดยตรง.
-    local Target = GreenZone.Position
-
-    if Indicator.Position ~= Target then
-        Indicator.Position = Target
-    end
-end
-
-local function DisconnectFishingVisualSignals()
-    if State.FishingIndicatorConn then
-        State.FishingIndicatorConn:Disconnect()
-        State.FishingIndicatorConn = nil
-    end
-
-    if State.FishingGreenConn then
-        State.FishingGreenConn:Disconnect()
-        State.FishingGreenConn = nil
-    end
-
-    if State.FishingVisibleConn then
-        State.FishingVisibleConn:Disconnect()
-        State.FishingVisibleConn = nil
-    end
-end
-
-local function BindFishingVisualSignals()
-    DisconnectFishingVisualSignals()
-
-    local Indicator, GreenZone, Minigame =
-        GetFishingMinigameObjects()
-
-    if not Indicator or not GreenZone or not Minigame then
-        return false
-    end
-
-    -- จุดสำคัญ:
-    -- FishingUI ของเกมเขียน Indicator.Position ใหม่ทุก Render frame.
-    -- เราดัก PropertyChanged ของ Position โดยตรง ทำให้ทันทีที่เกมเขียนค่า i
-    -- ขีดถูกเขียนกลับไป GreenZone.Position ใน event เดียวกัน.
-    State.FishingIndicatorConn =
-        Indicator:GetPropertyChangedSignal("Position"):Connect(function()
-            if
-                State.FishingVisualBind and
-                Options.FishingMinigameAssist.Value and
-                Minigame.Visible and
-                Indicator.Position ~= GreenZone.Position then
-
-                Indicator.Position = GreenZone.Position
-            end
+    if Indicator then
+        pcall(function()
+            Indicator.Visible = true
         end)
+    end
 
-    State.FishingGreenConn =
-        GreenZone:GetPropertyChangedSignal("Position"):Connect(function()
-            if
-                State.FishingVisualBind and
-                Options.FishingMinigameAssist.Value and
-                Minigame.Visible and
-                Indicator.Position ~= GreenZone.Position then
-
-                Indicator.Position = GreenZone.Position
-            end
+    if GreenZone then
+        pcall(function()
+            GreenZone.Visible = true
         end)
+    end
 
-    State.FishingVisibleConn =
-        Minigame:GetPropertyChangedSignal("Visible"):Connect(function()
-            if
-                State.FishingVisualBind and
-                Options.FishingMinigameAssist.Value and
-                Minigame.Visible then
+    State.FishingAssistOverlay = nil
+    State.FishingStaticGreen = nil
 
-                Indicator.Position = GreenZone.Position
-            end
-        end)
-
-    return true
+    pcall(function()
+        RunService:UnbindFromRenderStep(
+            "RCA_FishingInstantGreen"
+        )
+    end)
 end
 
 local function StartFishingVisualLock()
-    if State.FishingVisualBind then
-        ForceFishingIndicatorToGreen()
-        return
-    end
-
+    -- ไม่แตะ GUI ระหว่างตกปลาเลย
     State.FishingVisualBind = true
-    BindFishingVisualSignals()
-
-    pcall(function()
-        RunService:UnbindFromRenderStep(FISHING_VISUAL_BIND)
-    end)
-
-    -- สำรองอีกชั้นหลัง Render loop ของเกม
-    RunService:BindToRenderStep(
-        FISHING_VISUAL_BIND,
-        Enum.RenderPriority.Last.Value + 100,
-        function()
-            if
-                not State.Alive or
-                not Options.FishingMinigameAssist.Value then
-
-                return
-            end
-
-            ForceFishingIndicatorToGreen()
-        end
-    )
-
-    ForceFishingIndicatorToGreen()
 end
 
 local function StopFishingVisualLock()
     State.FishingVisualBind = false
-    DisconnectFishingVisualSignals()
+end
 
-    pcall(function()
-        RunService:UnbindFromRenderStep(FISHING_VISUAL_BIND)
+task.defer(ClearOldFishingVisualsOnce)
+
+do
+    local function FindFishingClientModules()
+        local PlayerScripts =
+            LocalPlayer:FindFirstChild("PlayerScripts")
+
+        if not PlayerScripts then
+            return nil, nil
+        end
+
+        local Client =
+            PlayerScripts:FindFirstChild(
+                "FishingClient",
+                true
+            )
+
+        if not Client then
+            return nil, nil
+        end
+
+        local FXModule =
+            Client:FindFirstChild("FishingFX")
+
+        local UIModule =
+            Client:FindFirstChild("FishingUI")
+
+        local FX
+        local UI
+
+        if
+            FXModule and
+            FXModule:IsA("ModuleScript") then
+
+            pcall(function()
+                FX = require(FXModule)
+            end)
+        end
+
+        if
+            UIModule and
+            UIModule:IsA("ModuleScript") then
+
+            pcall(function()
+                UI = require(UIModule)
+            end)
+        end
+
+        return FX, UI
+    end
+
+    State.ApplyFishingLowFX = function()
+        if State.FishingLowFXApplied then
+            return true
+        end
+
+        if
+            not FishingConfig or
+            type(FishingConfig.Effects) ~= "table" then
+
+            return false
+        end
+
+        local FX, UI =
+            FindFishingClientModules()
+
+        if
+            type(FX) ~= "table" or
+            type(UI) ~= "table" then
+
+            return false
+        end
+
+        State.FishingFXTable = FX
+        State.FishingUITable = UI
+
+        if not State.FishingConfigOriginal then
+            State.FishingConfigOriginal = {
+                UseCinematic =
+                    FishingConfig.UseCinematic,
+                Effects = {}
+            }
+
+            for Key, Value in
+                pairs(FishingConfig.Effects) do
+
+                State.FishingConfigOriginal
+                    .Effects[Key] = Value
+            end
+        end
+
+        if not State.FishingFXOriginal then
+            State.FishingFXOriginal = {
+                BeginCameraEffects =
+                    FX.BeginCameraEffects,
+                BitePunch =
+                    FX.BitePunch,
+                PlayCinematic =
+                    FX.PlayCinematic,
+                SetReeling =
+                    FX.SetReeling,
+                ShowFish =
+                    FX.ShowFish
+            }
+        end
+
+        if not State.FishingUIOriginal then
+            State.FishingUIOriginal = {
+                UpdateMinigame =
+                    UI.UpdateMinigame,
+                FlashScreen =
+                    UI.FlashScreen,
+                ShowBiteAlert =
+                    UI.ShowBiteAlert,
+                ShowAnnounce =
+                    UI.ShowAnnounce
+            }
+        end
+
+        -- หยุด camera/reel effect ที่อาจกำลังค้างก่อน patch
+        pcall(function()
+            if FX.EndCameraEffects then
+                FX.EndCameraEffects()
+            end
+        end)
+
+        pcall(function()
+            if FX.StopCinematic then
+                FX.StopCinematic()
+            end
+        end)
+
+        -- ปิด effect flags ที่ FishingUI/FishingFX อ่านทุก frame
+        local Effects =
+            FishingConfig.Effects
+
+        Effects.BiteFlash = false
+        Effects.BiteZoom = false
+        Effects.EdgeGlow = false
+        Effects.TensionShake = false
+        Effects.TensionZoom = false
+        Effects.Heartbeat = false
+        Effects.ReelSound = false
+        Effects.BarPunch = false
+        Effects.GreenPulse = false
+
+        FishingConfig.UseCinematic = false
+
+        -- ตัด camera/VFX ที่ FishingClient เรียกตอน bite/catch
+        FX.BeginCameraEffects =
+            function() end
+
+        FX.BitePunch =
+            function() end
+
+        FX.PlayCinematic =
+            function() end
+
+        FX.SetReeling =
+            function() end
+
+        -- Legendary/Mythic ตอนจับได้จะสร้าง ParticleEmitter +
+        -- PointLight + RenderStepped หมุนปลา 3 วิ
+        -- Auto Fishing ไม่จำเป็นต้อง render ฉากนี้
+        FX.ShowFish =
+            function() end
+
+        -- ตัด flash/tween แจ้งเตือนที่ไม่จำเป็นกับ Auto Fishing
+        UI.FlashScreen =
+            function() end
+
+        UI.ShowBiteAlert =
+            function() end
+
+        UI.ShowAnnounce =
+            function() end
+
+        local OriginalUpdate =
+            State.FishingUIOriginal.UpdateMinigame
+
+        if type(OriginalUpdate) == "function" then
+            UI.UpdateMinigame =
+                function(Data)
+
+                    if type(Data) ~= "table" then
+                        return OriginalUpdate(Data)
+                    end
+
+                    -- Controller ของเรายังได้ t/a จริงจาก FishingState
+                    -- แต่ UI เกมไม่ต้อง render:
+                    -- 1) bar shake ตอน t >= .75
+                    -- 2) MoveArrow pulse ทุก frame
+                    local RealT = Data.t
+                    local RealA = Data.a
+
+                    local T =
+                        tonumber(RealT)
+
+                    if T and T >= 0.75 then
+                        Data.t = 0.70
+                    end
+
+                    Data.a = 0
+
+                    local Result =
+                        OriginalUpdate(Data)
+
+                    Data.t = RealT
+                    Data.a = RealA
+
+                    return Result
+                end
+        end
+
+        State.FishingLowFXApplied = true
+        return true
+    end
+
+    State.RestoreFishingLowFX = function()
+        if not State.FishingLowFXApplied then
+            return
+        end
+
+        local FX =
+            State.FishingFXTable
+
+        local UI =
+            State.FishingUITable
+
+        local FXOriginal =
+            State.FishingFXOriginal
+
+        local UIOriginal =
+            State.FishingUIOriginal
+
+        if
+            FX and
+            FXOriginal then
+
+            for Key, Value in
+                pairs(FXOriginal) do
+
+                FX[Key] = Value
+            end
+        end
+
+        if
+            UI and
+            UIOriginal then
+
+            for Key, Value in
+                pairs(UIOriginal) do
+
+                UI[Key] = Value
+            end
+        end
+
+        if
+            FishingConfig and
+            State.FishingConfigOriginal then
+
+            FishingConfig.UseCinematic =
+                State.FishingConfigOriginal
+                    .UseCinematic
+
+            if
+                type(FishingConfig.Effects) ==
+                "table" then
+
+                for Key, Value in
+                    pairs(
+                        State.FishingConfigOriginal
+                            .Effects
+                    ) do
+
+                    FishingConfig.Effects[Key] =
+                        Value
+                end
+            end
+        end
+
+        State.FishingLowFXApplied = false
+    end
+
+    local function TryApplyLowFX()
+        if
+            not State.Alive or
+            not Options.FishingLowFX.Value then
+
+            return
+        end
+
+        if State.ApplyFishingLowFX() then
+            return
+        end
+
+        -- FishingClient บางเครื่องโหลดช้ากว่า Hub เล็กน้อย
+        task.spawn(function()
+            for _ = 1, 16 do
+                if
+                    not State.Alive or
+                    not Options.FishingLowFX.Value then
+
+                    return
+                end
+
+                if State.ApplyFishingLowFX() then
+                    return
+                end
+
+                task.wait(0.25)
+            end
+        end)
+    end
+
+    Options.FishingLowFX:OnChanged(function()
+        if Options.FishingLowFX.Value then
+            TryApplyLowFX()
+        else
+            State.RestoreFishingLowFX()
+        end
     end)
+
+    task.defer(TryApplyLowFX)
 end
 
 Options.FishingMinigameAssist:OnChanged(function()
@@ -1701,7 +2694,14 @@ local function ResetFishingAssistTracking()
     State.FishingPrevTick = nil
     State.FishingIVelocity = 0
     State.FishingGVelocity = 0
+    State.FishingArrow = 0
+    State.FishingArrowChanged = 0
+    State.FishingTickEMA = 0.05
+    State.FishingPendingHold = nil
+    State.FishingPendingTicks = 0
+    State.FishingLastHoldChange = 0
 end
+
 
 local function RunFishingMinigameTick(Data)
     if
@@ -1712,109 +2712,382 @@ local function RunFishingMinigameTick(Data)
         return
     end
 
-    local Indicator = tonumber(Data.i)
-    local Green = tonumber(Data.g)
-    local Width = tonumber(Data.w) or 0.11
+    -- ค่าจริงจาก server เท่านั้น
+    local I = tonumber(Data.i)
+    local G = tonumber(Data.g)
 
-    if not Indicator or not Green then
+    if I == nil or G == nil then
         return
     end
 
+    local W =
+        math.max(
+            0.012,
+            tonumber(Data.w) or 0.11
+        )
+
+    local Arrow =
+        math.sign(
+            tonumber(Data.a) or 0
+        )
+
+    local InGreen =
+        tonumber(Data.k) == 1
+
+    local Tension =
+        math.clamp(
+            tonumber(Data.t) or 0,
+            0,
+            1
+        )
+
     local Now = os.clock()
+    local NominalDt = 0.05
+
     local Dt =
         State.FishingPrevTick and
-        math.clamp(Now - State.FishingPrevTick, 0.025, 0.12) or
-        0.05
+        math.clamp(
+            Now - State.FishingPrevTick,
+            0.025,
+            0.12
+        ) or
+        NominalDt
+
+    -- EMA ของช่วง tick:
+    -- ถ้า client มี spike จะเพิ่ม prediction horizon เอง
+    State.FishingTickEMA =
+        State.FishingTickEMA * 0.78 +
+        Dt * 0.22
+
+    local RawIV = 0
+    local RawGV = 0
 
     if State.FishingPrevI ~= nil then
-        local RawIVelocity =
-            (Indicator - State.FishingPrevI) / Dt
-
-        State.FishingIVelocity =
-            State.FishingIVelocity * 0.45 +
-            RawIVelocity * 0.55
+        RawIV =
+            (I - State.FishingPrevI) / Dt
     end
 
     if State.FishingPrevG ~= nil then
-        local RawGVelocity =
-            (Green - State.FishingPrevG) / Dt
-
-        State.FishingGVelocity =
-            State.FishingGVelocity * 0.35 +
-            RawGVelocity * 0.65
+        RawGV =
+            (G - State.FishingPrevG) / Dt
     end
 
-    State.FishingPrevI = Indicator
-    State.FishingPrevG = Green
+    -- smoothing พอประมาณ ไม่ตาม noise แต่ยังตอบสนองปลาเร็วทัน
+    State.FishingIVelocity =
+        State.FishingIVelocity * 0.28 +
+        RawIV * 0.72
+
+    State.FishingGVelocity =
+        State.FishingGVelocity * 0.38 +
+        RawGV * 0.62
+
+    if Arrow ~= State.FishingArrow then
+        State.FishingArrow = Arrow
+        State.FishingArrowChanged = Now
+    end
+
+    State.FishingPrevI = I
+    State.FishingPrevG = G
     State.FishingPrevTick = Now
 
-    -- Server เป็นคนคำนวณ i จริง และ client ส่งได้เพียง Hold=true/false
-    -- จึงเล็ง "กลางกรอบ" ล่วงหน้าจากความเร็วของทั้ง Indicator และ Green Zone.
-    local InGreen = tonumber(Data.k) == 1
-    local HalfGreen = math.max(0.025, Width)
+    local Mini =
+        FishingConfig and
+        FishingConfig.Minigame or
+        {}
+
+    local HoldAccel =
+        tonumber(Mini.HoldAccel) or 2.8
+
+    local GravityAccel =
+        tonumber(Mini.GravityAccel) or 2.1
+
+    local TelegraphTime =
+        tonumber(Mini.TelegraphTime) or 0.3
+
+    -- กรอบยิ่งแคบ = ปลายิ่งยาก
+    local Narrow =
+        math.clamp(
+            (0.12 - W) / 0.055,
+            0,
+            1
+        )
+
+    -- --------------------------------------------------------
+    -- Adaptive look-ahead
+    -- ปกติ ~1.2 tick
+    -- ถ้า tick เลท/เครื่องกระตุก เพิ่ม horizon ชดเชย
+    -- --------------------------------------------------------
+    local Jitter =
+        math.max(
+            0,
+            State.FishingTickEMA -
+            NominalDt
+        )
+
+    local Horizon =
+        math.clamp(
+            0.058 +
+            Jitter * 1.35 +
+            Narrow * 0.012,
+            0.052,
+            0.120
+        )
+
+    local ArrowAge =
+        Arrow ~= 0 and
+        math.max(
+            0,
+            Now - State.FishingArrowChanged
+        ) or
+        0
+
+    local ArrowProgress =
+        Arrow ~= 0 and
+        math.clamp(
+            ArrowAge /
+            math.max(TelegraphTime, 0.05),
+            0,
+            1
+        ) or
+        0
+
+    -- --------------------------------------------------------
+    -- Predict GreenZone
+    -- --------------------------------------------------------
+    local FutureG =
+        G +
+        State.FishingGVelocity *
+        Horizon
+
+    if Arrow ~= 0 then
+        -- >/ < เป็น telegraph ก่อนเปลี่ยนทิศ
+        -- เล็งด้านในของ GreenZone ล่วงหน้า ไม่ไปสุดขอบ
+        local ArrowLead =
+            W *
+            (
+                0.18 +
+                ArrowProgress * 0.22 +
+                Narrow * 0.06
+            )
+
+        -- tension สูงเล่น conservative ขึ้น
+        ArrowLead *=
+            1 -
+            math.max(
+                0,
+                Tension - 0.60
+            ) * 0.45
+
+        FutureG +=
+            Arrow *
+            ArrowLead
+    end
+
+    FutureG =
+        math.clamp(
+            FutureG,
+            0,
+            1
+        )
+
+    -- ตอนหลุดกรอบ ให้ไล่ center ปัจจุบันมากกว่าอนาคต
+    local Target
+
+    if InGreen then
+        Target = FutureG
+    else
+        Target =
+            G +
+            State.FishingGVelocity *
+            math.min(
+                Horizon,
+                0.045
+            )
+
+        if Arrow ~= 0 then
+            Target +=
+                Arrow *
+                W *
+                0.10
+        end
+
+        Target =
+            math.clamp(
+                Target,
+                0,
+                1
+            )
+    end
+
+    -- --------------------------------------------------------
+    -- Predict Indicator จาก input ปัจจุบัน
+    -- --------------------------------------------------------
+    local CurrentAccel =
+        State.FishingHolding and
+        HoldAccel or
+        -GravityAccel
+
+    local PredictedI =
+        I +
+        State.FishingIVelocity *
+        Horizon +
+        0.5 *
+        CurrentAccel *
+        Horizon *
+        Horizon
+
+    local Error =
+        Target - PredictedI
+
     local RelativeVelocity =
         State.FishingIVelocity -
         State.FishingGVelocity
 
-    -- Predict 1-2 server ticks ล่วงหน้าเพื่อลด overshoot.
-    local Horizon = InGreen and 0.075 or 0.105
+    -- --------------------------------------------------------
+    -- Braking-distance controller
+    -- ช่วยไม่ให้พุ่งเลย GreenZone แล้วค่อยแก้ทีหลัง
+    -- --------------------------------------------------------
+    local BrakeDistance = 0
 
-    local PredictedIndicator =
-        Indicator +
-        State.FishingIVelocity * Horizon
+    if RelativeVelocity > 0 then
+        BrakeDistance =
+            RelativeVelocity *
+            RelativeVelocity /
+            math.max(
+                2 * GravityAccel,
+                0.1
+            )
+    elseif RelativeVelocity < 0 then
+        BrakeDistance =
+            RelativeVelocity *
+            RelativeVelocity /
+            math.max(
+                2 * HoldAccel,
+                0.1
+            )
+    end
 
-    local PredictedGreen =
-        Green +
-        State.FishingGVelocity * Horizon
-
-    PredictedIndicator =
-        math.clamp(PredictedIndicator, 0, 1)
-
-    PredictedGreen =
-        math.clamp(PredictedGreen, 0, 1)
-
-    local Error = PredictedGreen - PredictedIndicator
-
-    -- ถ้าอยู่ในกรอบแล้ว ให้เบรกก่อนถึงขอบเพื่อเกาะกลางมากที่สุด.
-    local CenterBand =
+    local DeadBand =
         math.clamp(
-            HalfGreen * (InGreen and 0.16 or 0.08),
-            0.006,
-            0.025
+            W *
+            (
+                0.055 -
+                Narrow * 0.012
+            ),
+            0.0025,
+            0.007
         )
 
-    local Hold
+    local Candidate =
+        State.FishingHolding
 
-    if Error > CenterBand then
-        Hold = true
-
-        -- กำลังวิ่งเข้าหากลางเร็วอยู่แล้ว ให้ปล่อยก่อนเพื่อลดการเลยกรอบ.
+    if RelativeVelocity > 0 then
+        -- กำลังวิ่งขวา: ปล่อยก่อนถึง target ตาม stopping distance
         if
-            InGreen and
-            RelativeVelocity > 0.25 and
-            Error < HalfGreen * 0.42 then
+            Error <=
+            BrakeDistance +
+            DeadBand then
 
-            Hold = false
+            Candidate = false
+        elseif Error > DeadBand then
+            Candidate = true
         end
 
-    elseif Error < -CenterBand then
-        Hold = false
-
-        -- กำลังไหลกลับเร็วเกินไป ให้กดพยุงก่อนถึงกลาง.
+    elseif RelativeVelocity < 0 then
+        -- กำลังวิ่งซ้าย: กดเบรกก่อนถึง target
         if
-            InGreen and
-            RelativeVelocity < -0.25 and
-            -Error < HalfGreen * 0.42 then
+            -Error <=
+            BrakeDistance +
+            DeadBand then
 
-            Hold = true
+            Candidate = true
+        elseif Error < -DeadBand then
+            Candidate = false
         end
 
     else
-        -- ใกล้กลางมาก: ใช้ทิศความเร็วเป็นตัวเบรก.
-        Hold = RelativeVelocity < 0
+        if Error > DeadBand then
+            Candidate = true
+        elseif Error < -DeadBand then
+            Candidate = false
+        end
     end
 
-    SetFishingHold(Hold)
+    -- --------------------------------------------------------
+    -- Emergency edge guard
+    -- ใกล้หลุดกรอบจริง = เปลี่ยน input ทันที ไม่รอ confirmation
+    -- --------------------------------------------------------
+    local LeftEdge = G - W
+    local RightEdge = G + W
+
+    local EdgeMargin =
+        math.clamp(
+            W *
+            (
+                0.17 +
+                Narrow * 0.035
+            ),
+            0.008,
+            0.025
+        )
+
+    local Emergency = false
+
+    if I <= LeftEdge + EdgeMargin then
+        Candidate = true
+        Emergency = true
+    elseif I >= RightEdge - EdgeMargin then
+        Candidate = false
+        Emergency = true
+    end
+
+    -- --------------------------------------------------------
+    -- Lag compensation
+    -- ไม่ freeze input เมื่อ tick เลท เพราะปลา Legendary/Mythic
+    -- เปลี่ยนทิศเร็ว; Horizon ด้านบนชดเชย Dt/Jitter แล้ว
+    -- --------------------------------------------------------
+
+    -- --------------------------------------------------------
+    -- 2-tick confirmation
+    -- ป้องกัน HoldInput true/false สลับทุก tick จาก noise
+    -- แต่ arrow เริ่มใหม่/หลุดขอบให้ตอบสนองเร็ว
+    -- --------------------------------------------------------
+    if Candidate ~= State.FishingHolding then
+        if Candidate == State.FishingPendingHold then
+            State.FishingPendingTicks += 1
+        else
+            State.FishingPendingHold = Candidate
+            State.FishingPendingTicks = 1
+        end
+
+        local ArrowFresh =
+            Arrow ~= 0 and
+            ArrowAge <= 0.075
+
+        local Needed =
+            (
+                Emergency or
+                ArrowFresh or
+                not InGreen or
+                Narrow >= 0.55 or
+                Dt >= 0.075
+            ) and
+            1 or
+            2
+
+        if State.FishingPendingTicks >= Needed then
+            SetFishingHold(
+                Candidate,
+                Emergency
+            )
+
+            State.FishingPendingHold = nil
+            State.FishingPendingTicks = 0
+        end
+    else
+        State.FishingPendingHold = nil
+        State.FishingPendingTicks = 0
+    end
 end
 
 local function StopAutoFishing()
@@ -1837,6 +3110,131 @@ local function StopAutoFishing()
         end)
     end
 end
+
+local SellFishingPartsWhenFull
+
+SellFishingPartsWhenFull = function()
+    if
+        State.FishingSellingParts or
+        State.FishingSelling or
+        not SellItem then
+
+        return false
+    end
+
+    local MaterialId = GetFishingMaterialId()
+    local Before = GetFishingMaterialAmount()
+
+    if Before <= 0 then
+        State.FishingFull = false
+        return true
+    end
+
+    State.FishingSellingParts = true
+    State.FishingFull = true
+    State.FishingMode = "idle"
+    State.FishingAutoRunning = false
+    State.FishingAutoToken += 1
+
+    StopFishingVisualLock()
+    SetFishingHold(false)
+
+    if FishingAction then
+        pcall(function()
+            FishingAction:FireServer("autoOff")
+            FishingAction:FireServer("cancel")
+        end)
+    end
+
+    -- FishPart เป็น Material ของ Market ไม่ใช่ bucket fish ของ FishingShop
+    local Stall = Workspace:FindFirstChild("GlobalMarketStall", true)
+    local StallPart =
+        Stall and
+        (
+            Stall:IsA("BasePart") and Stall or
+            Stall:FindFirstChildWhichIsA("BasePart", true)
+        )
+
+    Teleport(
+        StallPart and
+        (StallPart.CFrame * CFrame.new(0, 3, 3)) or
+        SellPosition
+    )
+
+    task.wait(0.35)
+
+    local Sold = false
+
+    for _ = 1, 3 do
+        local Current = GetFishingMaterialAmount()
+
+        if Current <= 0 then
+            Sold = true
+            break
+        end
+
+        pcall(function()
+            SellItem:FireServer(MaterialId, Current)
+        end)
+
+        local Deadline = os.clock() + 1.25
+
+        repeat
+            task.wait(0.08)
+
+            if GetFishingMaterialAmount() < Current then
+                Sold = true
+                break
+            end
+        until os.clock() >= Deadline
+
+        if Sold then
+            break
+        end
+    end
+
+    local After = GetFishingMaterialAmount()
+
+    if After < Before then
+        Sold = true
+        State.FishingFull = false
+        State.FishingFullAmount = After
+
+        Notify(
+            "Auto Fishing",
+            "ขาย " ..
+            tostring(MaterialId) ..
+            " " ..
+            tostring(Before) ..
+            " → " ..
+            tostring(After)
+        )
+    else
+        Notify(
+            "Auto Fishing",
+            "FishPart เต็ม แต่ขายไม่สำเร็จ"
+        )
+    end
+
+    -- กลับจุดตกปลาเสมอ
+    Teleport(GetFishingZoneCFrame())
+    task.wait(0.25)
+
+    State.FishingSellingParts = false
+
+    if
+        Sold and
+        State.Alive and
+        Options.AutoFishing.Value then
+
+        EquipFishingRod()
+        task.wait(0.12)
+        task.spawn(StartAutoFishing)
+    end
+
+    return Sold
+end
+
 
 StartAutoFishing = function()
     if
@@ -1878,28 +3276,27 @@ StartAutoFishing = function()
     StopUndergroundFarm()
     StopGameFarm()
 
+    local CurrentBait = GetFishingBait()
+
     if
         Options.FishingAutoBuyBait.Value and
-        GetFishingBait() <= Options.FishingBaitThreshold.Value then
+        CurrentBait <= Options.FishingBaitThreshold.Value then
 
-        BuyFishingBait(true)
-        task.wait(0.2)
+        QueueAutoBuyBait(
+            CurrentBait <= 0,
+            false
+        )
     end
 
-    if GetFishingBait() <= 0 then
-        Notify("Auto Fishing", "เหยื่อหมด")
+    if CurrentBait <= 0 then
+        -- รอ Bait.Value Changed เป็นตัวเริ่มใหม่หลังซื้อ
         return
     end
 
     if not EquipFishingRod() then
-        local Rod = SelectedFishingRod()
-
-        Notify(
-            "Auto Fishing",
-            "ไม่พบ " .. tostring(Rod and Rod.ToolName or "Fishing Rod")
-        )
-
-        return
+        if not EnsureFishingRod() then
+            return
+        end
     end
 
     local HRP = Root()
@@ -1912,7 +3309,30 @@ StartAutoFishing = function()
         end
 
         Teleport(GetFishingZoneCFrame())
-        task.wait(0.45)
+        task.wait(0.35)
+    end
+
+    -- วาป/ซื้อของอาจทำ Tool หลุดมือ จึงเช็กอีกครั้งก่อน start จริง
+    if not EquipFishingRod() then
+        if os.clock() - State.LastFishingRodNotify >= 3 then
+            State.LastFishingRodNotify = os.clock()
+            Notify(
+                "Auto Fishing",
+                "พบ Backpack[\"" ..
+                GetSelectedRodToolName() ..
+                "\"] แต่ยังถือไม่สำเร็จ — กำลังลองใหม่"
+            )
+        end
+        State.FishingMode = "idle"
+        return
+    end
+
+    local EquippedTool = GetFishingRodTool()
+    local CurrentChar = Character()
+
+    if not EquippedTool or EquippedTool.Parent ~= CurrentChar then
+        State.FishingMode = "idle"
+        return
     end
 
     State.LastFishingStart = os.clock()
@@ -1942,6 +3362,14 @@ if FishingState then
             end
 
         elseif Action == "bite" then
+            -- ไม่ scan/แก้ GUI ตอน bite เพราะเป็นจังหวะที่ต้องลด spike
+            if
+                Options.FishingLowFX.Value and
+                State.ApplyFishingLowFX then
+
+                State.ApplyFishingLowFX()
+            end
+
             -- ถ้าไม่ได้เปิด Game Auto คู่กับ Auto Fishing จะเล่นมินิเกมจริง
             State.FishingMode = "fighting"
             State.FishingAutoRunning = false
@@ -1977,12 +3405,10 @@ if FishingState then
                 Options.AutoFishing.Value and
                 Options.FishingAutoBuyBait.Value then
 
-                task.delay(0.5, function()
-                    if BuyFishingBait(false) then
-                        task.wait(0.3)
-                        StartAutoFishing()
-                    end
-                end)
+                QueueAutoBuyBait(
+                    true,
+                    true
+                )
             end
 
         elseif Action == "autoStopFull" then
@@ -1994,10 +3420,20 @@ if FishingState then
             StopFishingVisualLock()
             SetFishingHold(false)
 
-            Notify(
-                "Auto Fishing",
-                "FishPart เต็ม — ลดจำนวนชิ้นส่วนปลาก่อน แล้วระบบจะเริ่มต่อเอง"
-            )
+            if
+                Options.FishingAutoSellFull.Value and
+                SellFishingPartsWhenFull then
+
+                task.spawn(SellFishingPartsWhenFull)
+            else
+                Notify(
+                    "Auto Fishing",
+                    "FishPart เต็ม " ..
+                    tostring(GetFishingMaterialAmount()) ..
+                    "/" ..
+                    tostring(GetFishingMaterialMax())
+                )
+            end
 
         elseif Action == "caught" then
             State.FishingMode = "idle"
@@ -2033,38 +3469,91 @@ if FishingState then
     end)
 end
 
-task.spawn(function()
-    while State.Alive do
-        if Options.AutoFishing.Value then
+local function StartFishingWatcher()
+    State.FishingLoopToken += 1
+    local Token = State.FishingLoopToken
+
+    task.spawn(function()
+        while
+            State.Alive and
+            Options.AutoFishing.Value and
+            Token == State.FishingLoopToken do
+
             if
-                Options.FishingAutoBuyBait.Value and
-                GetFishingBait() <= Options.FishingBaitThreshold.Value and
-                os.clock() - State.LastBaitBuy >= 3 then
+                not State.FishingBuyingRod and
+                not State.FishingSellingParts then
 
-                BuyFishingBait(true)
-            end
+                if
+                    Options.FishingAutoSellFull.Value and
+                    IsFishingMaterialFull() then
 
-            if State.FishingFull then
-                if GetFishingMaterialAmount() < State.FishingFullAmount then
-                    State.FishingFull = false
-                    task.wait(0.2)
+                    State.FishingFull = true
+                    State.FishingFullAmount = GetFishingMaterialAmount()
+                    SellFishingPartsWhenFull()
+
+                elseif State.FishingFull then
+                    if GetFishingMaterialAmount() < State.FishingFullAmount then
+                        State.FishingFull = false
+                        task.wait(0.2)
+                        StartAutoFishing()
+                    end
+
+                elseif
+                    State.FishingMode == "idle" and
+                    os.clock() - State.LastFishingStart >= 2 then
+
                     StartAutoFishing()
                 end
-
-            elseif
-                State.FishingMode == "idle" and
-                os.clock() - State.LastFishingStart >= 2 then
-
-                StartAutoFishing()
             end
-        end
 
-        task.wait(0.75)
+            task.wait(0.6)
+        end
+    end)
+end
+
+Options.FishingAutoSellFull:OnChanged(function()
+    if
+        Options.FishingAutoSellFull.Value and
+        Options.AutoFishing.Value and
+        IsFishingMaterialFull() and
+        SellFishingPartsWhenFull then
+
+        task.spawn(SellFishingPartsWhenFull)
+    end
+end)
+
+Options.FishingBaitThreshold:OnChanged(function()
+    if
+        Options.FishingAutoBuyBait.Value and
+        Options.AutoFishing.Value then
+
+        local Current = GetFishingBait()
+
+        if
+            Current <=
+            (
+                tonumber(
+                    Options.FishingBaitThreshold.Value
+                ) or 5
+            ) then
+
+            QueueAutoBuyBait(
+                Current <= 0,
+                false
+            )
+        end
     end
 end)
 
 AutoFishingToggle:OnChanged(function()
+    State.FishingLoopToken += 1
+
     if Options.AutoFishing.Value then
+        StartFishingWatcher()
+
+        if Options.FishingAutoBuyBait.Value then
+            BindAutoBaitConnection()
+        end
         if Options.AutoFarm.Value then
             pcall(function()
                 Options.AutoFarm:SetValue(false)
@@ -2250,6 +3739,119 @@ Tabs.Main:AddButton({
     end
 })
 
+--// SUPERMARKET
+Tabs.Main:AddSection("Supermarket")
+
+local SuperMarketValues = {}
+
+if
+    FoodConfig and
+    type(FoodConfig.Names) == "function" then
+
+    local OK, Names =
+        pcall(function()
+            return FoodConfig.Names()
+        end)
+
+    if OK and type(Names) == "table" then
+        for _, Name in ipairs(Names) do
+            table.insert(
+                SuperMarketValues,
+                tostring(Name)
+            )
+        end
+    end
+end
+
+if #SuperMarketValues == 0 then
+    SuperMarketValues = {
+        "เบอร์เกอร์",
+        "ขนมชุบ",
+        "ขนมถ้วย",
+        "ขนมวุ้น",
+        "ขนมเทียน",
+        "ขนมชั้น",
+        "ต้มยำกุ้ง",
+        "นมโปรตีนสตรอเบอร์รี",
+        "ชาเขียวเย็น",
+        "ชาเขียวเย็นผสมกาแฟ",
+        "โคลด์ไต้หวันครีม",
+        "สตรอเบอร์รีโซดา"
+    }
+end
+
+local SuperMarketDropdown =
+    Tabs.Main:AddDropdown(
+        "SuperMarketItem",
+        {
+            Title = "Select Supermarket Item",
+            Description = "เลือกอาหาร/เครื่องดื่มจาก Supermarket",
+            Values = SuperMarketValues,
+            Multi = false,
+            Default =
+                #SuperMarketValues > 0 and
+                1 or
+                nil,
+            Searchable = true
+        }
+    )
+
+Tabs.Main:AddButton({
+    Title = "Buy Supermarket Item",
+    Description = "ซื้อของที่เลือกผ่าน SuperMarketEvent.ConfirmEvent",
+
+    Callback = function()
+        local Remote =
+            ReplicatedStorage:
+                FindFirstChild("SuperMarketEvent")
+
+        Remote =
+            Remote and
+            Remote:FindFirstChild("ConfirmEvent")
+
+        if
+            not Remote or
+            not Remote:IsA("RemoteEvent") then
+
+            Notify(
+                "Supermarket",
+                "ไม่พบ SuperMarketEvent.ConfirmEvent"
+            )
+
+            return
+        end
+
+        SuperMarketConfirm = Remote
+
+        local ItemName =
+            Options.SuperMarketItem.Value
+
+        if
+            not ItemName or
+            ItemName == "" then
+
+            Notify(
+                "Supermarket",
+                "กรุณาเลือกสินค้า"
+            )
+
+            return
+        end
+
+        local OK =
+            pcall(function()
+                Remote:FireServer(ItemName)
+            end)
+
+        Notify(
+            "Supermarket",
+            OK and
+            ("สั่งซื้อ " .. tostring(ItemName)) or
+            "Remote error"
+        )
+    end
+})
+
 --// AUTO CRAFT
 Tabs.Main:AddSection("Auto Craft")
 
@@ -2306,26 +3908,43 @@ if CraftResult then
     end)
 end
 
-task.spawn(function()
-    while State.Alive do
-        if Options.AutoCraft.Value and not Options.AutoFarm.Value and not State.Selling and RequestCraft then
-            local HRP = Root()
-            if HRP then
-                if (HRP.Position - CraftPosition).Magnitude > 10 then
-                    Teleport(CFrame.new(CraftPosition))
-                    task.wait(0.2)
-                end
+local function StartCraftWatcher()
+    State.CraftLoopToken += 1
+    local Token = State.CraftLoopToken
 
-                if not State.CraftBusy and os.clock() - State.LastCraft >= 0.6 then
-                    local RecipeId = RecipeMap[Options.CraftItem.Value]
-                    if RecipeId then
-                        State.LastCraft = os.clock()
-                        RequestCraft:FireServer(RecipeId)
+    task.spawn(function()
+        while
+            State.Alive and
+            Options.AutoCraft.Value and
+            Token == State.CraftLoopToken do
+
+            if not Options.AutoFarm.Value and not State.Selling and RequestCraft then
+                local HRP = Root()
+                if HRP then
+                    if (HRP.Position - CraftPosition).Magnitude > 10 then
+                        Teleport(CFrame.new(CraftPosition))
+                        task.wait(0.2)
+                    end
+
+                    if not State.CraftBusy and os.clock() - State.LastCraft >= 0.6 then
+                        local RecipeId = RecipeMap[Options.CraftItem.Value]
+                        if RecipeId then
+                            State.LastCraft = os.clock()
+                            RequestCraft:FireServer(RecipeId)
+                        end
                     end
                 end
             end
+
+            task.wait(0.15)
         end
-        task.wait(0.15)
+    end)
+end
+
+AutoCraftToggle:OnChanged(function()
+    State.CraftLoopToken += 1
+    if Options.AutoCraft.Value then
+        StartCraftWatcher()
     end
 end)
 
@@ -2410,58 +4029,125 @@ local function CreateESP(Player)
     }
 end
 
-for _, Player in ipairs(Players:GetPlayers()) do
-    if Player ~= LocalPlayer and Player.Character then
-        task.defer(CreateESP, Player)
+local function AnyESPEnabled()
+    return
+        Options.ESPChams.Value or
+        Options.ESPName.Value or
+        Options.ESPRank.Value or
+        Options.ESPHealth.Value
+end
+
+local function StopESPRuntime()
+    State.ESPLoopToken += 1
+
+    if State.ESPPlayerAddedConnection then
+        pcall(function()
+            State.ESPPlayerAddedConnection:Disconnect()
+        end)
+        State.ESPPlayerAddedConnection = nil
+    end
+
+    if State.ESPPlayerRemovingConnection then
+        pcall(function()
+            State.ESPPlayerRemovingConnection:Disconnect()
+        end)
+        State.ESPPlayerRemovingConnection = nil
+    end
+
+    for Player in pairs(State.ESP) do
+        RemoveESP(Player)
     end
 end
 
-Connect(Players.PlayerAdded, function(Player)
-    Connect(Player.CharacterAdded, function()
-        task.wait(0.3)
-        CreateESP(Player)
-    end)
-end)
+local function StartESPRuntime()
+    if not AnyESPEnabled() then
+        StopESPRuntime()
+        return
+    end
 
-Connect(Players.PlayerRemoving, RemoveESP)
+    if not State.ESPPlayerAddedConnection then
+        State.ESPPlayerAddedConnection =
+            Players.PlayerAdded:Connect(function(Player)
+                Player.CharacterAdded:Connect(function()
+                    if not AnyESPEnabled() then return end
+                    task.wait(0.2)
+                    CreateESP(Player)
+                end)
+            end)
+    end
 
-task.spawn(function()
-    while State.Alive do
-        local showChams = Options.ESPChams.Value
-        local showName = Options.ESPName.Value
-        local showRank = Options.ESPRank.Value
-        local showHealth = Options.ESPHealth.Value
+    if not State.ESPPlayerRemovingConnection then
+        State.ESPPlayerRemovingConnection =
+            Players.PlayerRemoving:Connect(RemoveESP)
+    end
 
-        for Player, Data in pairs(State.ESP) do
-            if not Player.Parent or not Data.Character.Parent then
-                RemoveESP(Player)
-            else
-                Data.Highlight.Enabled = showChams
+    for _, Player in ipairs(Players:GetPlayers()) do
+        if
+            Player ~= LocalPlayer and
+            Player.Character and
+            not State.ESP[Player] then
 
-                if showName or showRank or showHealth then
-                    local Lines = {}
-                    if showName then
-                        table.insert(Lines, Player.DisplayName .. " (@" .. Player.Name .. ")")
-                    end
-                    if showRank then
-                        table.insert(Lines, "ยศ: " .. Data.Rank)
-                    end
-                    if showHealth then
-                        local HP = math.clamp(tonumber(Data.Humanoid.Health) or 0, 0, 999999999)
-                        local MaxHP = math.clamp(tonumber(Data.Humanoid.MaxHealth) or 0, 0, 999999999)
-                        table.insert(Lines, string.format("HP: %d/%d", math.floor(HP), math.floor(MaxHP)))
-                    end
+            task.defer(CreateESP, Player)
+        end
+    end
 
-                    Data.Label.Text = table.concat(Lines, "\n")
-                    Data.Gui.Enabled = true
+    State.ESPLoopToken += 1
+    local Token = State.ESPLoopToken
+
+    task.spawn(function()
+        while
+            State.Alive and
+            AnyESPEnabled() and
+            Token == State.ESPLoopToken do
+
+            local showChams = Options.ESPChams.Value
+            local showName = Options.ESPName.Value
+            local showRank = Options.ESPRank.Value
+            local showHealth = Options.ESPHealth.Value
+
+            for Player, Data in pairs(State.ESP) do
+                if not Player.Parent or not Data.Character.Parent then
+                    RemoveESP(Player)
                 else
-                    Data.Gui.Enabled = false
+                    Data.Highlight.Enabled = showChams
+
+                    if showName or showRank or showHealth then
+                        local Lines = {}
+
+                        if showName then
+                            table.insert(Lines, Player.DisplayName .. " (@" .. Player.Name .. ")")
+                        end
+                        if showRank then
+                            table.insert(Lines, "ยศ: " .. Data.Rank)
+                        end
+                        if showHealth then
+                            local HP = math.clamp(tonumber(Data.Humanoid.Health) or 0, 0, 999999999)
+                            local MaxHP = math.clamp(tonumber(Data.Humanoid.MaxHealth) or 0, 0, 999999999)
+                            table.insert(Lines, string.format("HP: %d/%d", math.floor(HP), math.floor(MaxHP)))
+                        end
+
+                        Data.Label.Text = table.concat(Lines, "\n")
+                        Data.Gui.Enabled = true
+                    else
+                        Data.Gui.Enabled = false
+                    end
                 end
             end
+
+            task.wait(0.35)
         end
-        task.wait(0.3)
-    end
-end)
+    end)
+end
+
+for _, Name in ipairs({"ESPChams", "ESPName", "ESPRank", "ESPHealth"}) do
+    Options[Name]:OnChanged(function()
+        if AnyESPEnabled() then
+            StartESPRuntime()
+        else
+            StopESPRuntime()
+        end
+    end)
+end
 
 --// PLAYER TAB
 Tabs.Player:AddSection("Movement")
@@ -2474,6 +4160,172 @@ Tabs.Player:AddToggle("TPWalk", { Title = "TP Walk", Default = false })
 Tabs.Player:AddSlider("TPWalkSpeed", { Title = "TP Walk Speed", Min = 10, Max = 300, Default = 60, Rounding = 0 })
 
 local WalkSpeedSlider = Tabs.Player:AddSlider("WalkSpeed", { Title = "WalkSpeed", Min = 0, Max = 250, Default = 16, Rounding = 0 })
+
+Tabs.Player:AddToggle("AntiVoid", {
+    Title = "Anti Void",
+    Description = "สร้างพื้นกันตก 3 ชั้น + วาปกลับจุดปลอดภัยก่อนลง Void",
+    Default = false
+})
+
+local ANTI_VOID_LEVELS = {-125, -145, -165}
+local ANTI_VOID_TRIGGER_Y = -110
+local ANTI_VOID_FALLBACK_Y = -90
+local ANTI_VOID_SIZE = Vector3.new(700, 2, 700)
+
+local function StopAntiVoid()
+    if State.AntiVoidConnection then
+        pcall(function()
+            State.AntiVoidConnection:Disconnect()
+        end)
+        State.AntiVoidConnection = nil
+    end
+
+    if State.AntiVoidFolder then
+        pcall(function()
+            State.AntiVoidFolder:Destroy()
+        end)
+        State.AntiVoidFolder = nil
+    end
+
+    table.clear(State.AntiVoidParts)
+    State.AntiVoidLastSafe = nil
+end
+
+local function StartAntiVoid()
+    StopAntiVoid()
+
+    local HRP = Root()
+    if not HRP then return end
+
+    local Folder = Instance.new("Folder")
+    Folder.Name = "RCA_AntiVoid"
+    Folder.Parent = Workspace
+    State.AntiVoidFolder = Folder
+
+    for Index, Y in ipairs(ANTI_VOID_LEVELS) do
+        local Plate = Instance.new("Part")
+        Plate.Name = "AntiVoid_" .. tostring(Index)
+        Plate.Anchored = true
+        Plate.CanCollide = true
+        Plate.CanTouch = false
+        Plate.CanQuery = false
+        Plate.Size = ANTI_VOID_SIZE
+        Plate.Transparency = 0.72
+        Plate.Position = Vector3.new(
+            HRP.Position.X,
+            Y,
+            HRP.Position.Z
+        )
+        Plate.Parent = Folder
+
+        table.insert(State.AntiVoidParts, Plate)
+    end
+
+    State.AntiVoidLastSafe = HRP.CFrame
+    State.AntiVoidLastSafeTick = os.clock()
+
+    State.AntiVoidConnection =
+        RunService.Heartbeat:Connect(function()
+            if not State.Alive or not Options.AntiVoid.Value then
+                return
+            end
+
+            local CurrentHRP = Root()
+            local Hum = Humanoid()
+
+            if not CurrentHRP or not Hum or Hum.Health <= 0 then
+                return
+            end
+
+            -- ให้พื้น 3 ชั้นตาม X/Z ของผู้เล่น แต่ Y คงที่
+            for Index, Plate in ipairs(State.AntiVoidParts) do
+                local Y = ANTI_VOID_LEVELS[Index]
+
+                if Plate and Plate.Parent and Y then
+                    Plate.Position = Vector3.new(
+                        CurrentHRP.Position.X,
+                        Y,
+                        CurrentHRP.Position.Z
+                    )
+                end
+            end
+
+            local Now = os.clock()
+            local Y = CurrentHRP.Position.Y
+            local FallingSpeed = CurrentHRP.AssemblyLinearVelocity.Y
+
+            -- จำเฉพาะจุดที่ยืน/เคลื่อนที่แบบปลอดภัย
+            -- ไม่อัปเดต last safe ระหว่างกำลังร่วงลง Void
+            if
+                Y > ANTI_VOID_TRIGGER_Y + 8 and
+                (
+                    Hum.FloorMaterial ~= Enum.Material.Air or
+                    FallingSpeed > -4
+                ) and
+                Now - State.AntiVoidLastSafeTick >= 0.2 then
+
+                State.AntiVoidLastSafe = CurrentHRP.CFrame
+                State.AntiVoidLastSafeTick = Now
+            end
+
+            local Danger =
+                Y <= ANTI_VOID_TRIGGER_Y or
+                (
+                    Y < ANTI_VOID_TRIGGER_Y + 12 and
+                    FallingSpeed <= -90
+                )
+
+            if
+                Danger and
+                Now - State.AntiVoidLastRescue >= 0.8 then
+
+                State.AntiVoidLastRescue = Now
+
+                local Target = State.AntiVoidLastSafe
+
+                if
+                    not Target or
+                    Target.Position.Y <= ANTI_VOID_TRIGGER_Y + 5 then
+
+                    Target = CFrame.new(
+                        CurrentHRP.Position.X,
+                        ANTI_VOID_FALLBACK_Y,
+                        CurrentHRP.Position.Z
+                    )
+                end
+
+                -- ยกขึ้นจากจุดปลอดภัยเล็กน้อย กันติดพื้น/ขอบ part
+                Teleport(Target * CFrame.new(0, 4, 0))
+
+                pcall(function()
+                    Hum:ChangeState(Enum.HumanoidStateType.Jumping)
+                end)
+
+                Notify(
+                    "Anti Void",
+                    "ช่วยขึ้นจาก Void แล้ว"
+                )
+            end
+        end)
+end
+
+do
+    local AntiVoidOption = Options.AntiVoid
+
+    if
+        AntiVoidOption and
+        type(AntiVoidOption.OnChanged) == "function" then
+
+        AntiVoidOption:OnChanged(function()
+            if AntiVoidOption.Value then
+                StartAntiVoid()
+            else
+                StopAntiVoid()
+            end
+        end)
+    end
+end
+
 
 local function StopFly()
     if State.FlyVelocity then State.FlyVelocity:Destroy() State.FlyVelocity = nil end
@@ -2508,11 +4360,17 @@ local function StartFly()
     Hum.AutoRotate = false
 end
 
-FlyToggle:OnChanged(function()
-    if Options.Fly.Value then StartFly() else StopFly() end
-end)
+local function StopMovementRuntime()
+    if State.MovementConnection then
+        pcall(function() State.MovementConnection:Disconnect() end)
+        State.MovementConnection = nil
+    end
+end
 
-Connect(RunService.RenderStepped, function(Delta)
+local function UpdateMovementRuntime()
+    if Options.Fly.Value or Options.TPWalk.Value then
+        if State.MovementConnection then return end
+State.MovementConnection = RunService.RenderStepped:Connect(function(Delta)
     if Options.Fly.Value then
         local HRP = Root()
         local Hum = Humanoid()
@@ -2546,6 +4404,26 @@ Connect(RunService.RenderStepped, function(Delta)
     end
 end)
 
+    else
+        StopMovementRuntime()
+    end
+end
+
+-- Bind movement toggles only after UpdateMovementRuntime exists.
+FlyToggle:OnChanged(function()
+    if Options.Fly.Value then
+        StartFly()
+    else
+        StopFly()
+    end
+
+    UpdateMovementRuntime()
+end)
+
+Options.TPWalk:OnChanged(function()
+    UpdateMovementRuntime()
+end)
+
 local function RestoreNoclip()
     for Part, Value in pairs(State.NoclipParts) do
         if Part and Part.Parent then
@@ -2560,31 +4438,65 @@ local function RestoreNoclip()
     table.clear(State.NoclipParts)
 end
 
-NoclipToggle:OnChanged(function()
-    if not Options.Noclip.Value then RestoreNoclip() end
-end)
-
-Connect(RunService.Stepped, function()
-    if not Options.Noclip.Value then return end
-    for _, Part in ipairs(State.CharParts) do
-        if Part and Part.Parent then
-            if State.NoclipParts[Part] == nil then
-                State.NoclipParts[Part] =
-                    State.UndergroundParts[Part] ~= nil
-                    and State.UndergroundParts[Part]
-                    or Part.CanCollide
-            end
-
-            Part.CanCollide = false
-        end
+local function StopNoclipRuntime()
+    if State.NoclipConnection then
+        pcall(function()
+            State.NoclipConnection:Disconnect()
+        end)
+        State.NoclipConnection = nil
     end
-end)
 
-WalkSpeedSlider:OnChanged(function(Value)
-    State.WalkSpeed = Value
-    local Hum = Humanoid()
-    if Hum then Hum.WalkSpeed = Value end
-end)
+    RestoreNoclip()
+end
+
+do
+    local NoclipOption = Options.Noclip
+
+    if NoclipOption and type(NoclipOption.OnChanged) == "function" then
+        NoclipOption:OnChanged(function()
+            if NoclipOption.Value then
+                UpdateCharParts()
+
+                if not State.NoclipConnection then
+                    State.NoclipConnection =
+                        RunService.Stepped:Connect(function()
+                            if not NoclipOption.Value then return end
+
+                            for _, Part in ipairs(State.CharParts) do
+                                if Part and Part.Parent then
+                                    if State.NoclipParts[Part] == nil then
+                                        State.NoclipParts[Part] =
+                                            State.UndergroundParts[Part] ~= nil and
+                                            State.UndergroundParts[Part] or
+                                            Part.CanCollide
+                                    end
+
+                                    Part.CanCollide = false
+                                end
+                            end
+                        end)
+                end
+            else
+                StopNoclipRuntime()
+            end
+        end)
+    end
+end
+
+do
+    local WalkSpeedOption = Options.WalkSpeed
+
+    if WalkSpeedOption and type(WalkSpeedOption.OnChanged) == "function" then
+        WalkSpeedOption:OnChanged(function(Value)
+            State.WalkSpeed = tonumber(Value) or State.WalkSpeed
+
+            local Hum = Humanoid()
+            if Hum then
+                Hum.WalkSpeed = State.WalkSpeed
+            end
+        end)
+    end
+end
 
 --// TELEPORT TAB
 Tabs.Teleport:AddSection("Teleport")
@@ -2615,7 +4527,7 @@ Tabs.Teleport:AddButton({
 
 Tabs.Teleport:AddButton({
     Title = "Fishing Zone",
-    Description = "ไปจุดตกปลา",
+    Description = "-1514, -75, 2822",
     Callback = function()
         Teleport(GetFishingZoneCFrame())
     end
@@ -2629,6 +4541,282 @@ Tabs.Teleport:AddButton({
     end
 })
 
+--// MISC TAB - PERFORMANCE
+local RestoreDeleteMap
+
+do
+Tabs.Misc:AddSection("Performance")
+
+local DELETE_MAP_ARMY_NAME =
+    "\224\184\149\224\184\182\224\184\129\224\184\129\224\184\173\224\184\135\224\184\151\224\184\177\224\184\158\224\184\154\224\184\129"
+
+local DELETE_MAP_CRITICAL = {
+    Vector3.new(-1514, -75, 2822),   -- Fishing farm
+    Vector3.new(-1627, -62, 3274),   -- Fishing shop
+    Vector3.new(-2088, -61, 3235),   -- Market
+    Vector3.new(-2103, -65, 3269),   -- Craft
+    Vector3.new(-2755, -30, 3987),   -- Banana
+    Vector3.new(-2238, -49, 4504),   -- Tank
+    Vector3.new(-2716, -43, 3362)    -- Dress
+}
+
+local DELETE_MAP_KEEP_WORDS = {
+    "floor", "ground", "road", "baseplate",
+    "spawn", "shop", "market", "stall",
+    "zone", "giver", "armor", "armband",
+    "red kg", "headset", "webbing", "peaked",
+    "พื้น", "ถนน", "ขาย", "ร้าน", "ตลาด",
+    "ตกปลา", "ฟาร์ม", "เกิด"
+}
+
+local function HasHumanoidAncestor(Object, StopAt)
+    local Parent = Object.Parent
+
+    while Parent and Parent ~= StopAt do
+        if
+            Parent:IsA("Model") and
+            Parent:FindFirstChildOfClass("Humanoid") then
+
+            return true
+        end
+
+        Parent = Parent.Parent
+    end
+
+    return false
+end
+
+local function NearDeleteMapCritical(Position, Radius)
+    Radius = Radius or 80
+
+    for _, Point in ipairs(DELETE_MAP_CRITICAL) do
+        local Offset =
+            Vector2.new(
+                Position.X - Point.X,
+                Position.Z - Point.Z
+            )
+
+        if Offset.Magnitude <= Radius then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function KeepMapPart(Part, Maps, Army)
+    if not Part or not Part.Parent then
+        return true
+    end
+
+    -- Auto Dress ใช้ GetChildren()[index] ในตึกนี้
+    -- ต้องเก็บทั้งตึกไว้ ไม่งั้น index เปลี่ยน
+    if Army and Part:IsDescendantOf(Army) then
+        return true
+    end
+
+    if Part:IsA("SpawnLocation") then
+        return true
+    end
+
+    if HasHumanoidAncestor(Part, Maps) then
+        return true
+    end
+
+    if
+        Part:FindFirstChildOfClass("ProximityPrompt") or
+        Part:FindFirstChildOfClass("ClickDetector") then
+
+        return true
+    end
+
+    local Name = string.lower(tostring(Part.Name or ""))
+
+    for _, Word in ipairs(DELETE_MAP_KEEP_WORDS) do
+        if string.find(Name, Word, 1, true) then
+            return true
+        end
+    end
+
+    -- เก็บพื้นแผ่นใหญ่ไว้เดิน
+    local Size = Part.Size
+
+    if
+        Size.Y <= 12 and
+        Size.X >= 35 and
+        Size.Z >= 35 then
+
+        return true
+    end
+
+    -- เก็บพื้น/ชิ้นส่วนใกล้จุดใช้งานหลัก
+    if
+        Size.Y <= 18 and
+        NearDeleteMapCritical(Part.Position, 90) then
+
+        return true
+    end
+
+    return false
+end
+
+RestoreDeleteMap = function()
+    State.DeleteMapToken += 1
+    State.DeleteMapBusy = false
+
+    for Index = #State.DeletedMapItems, 1, -1 do
+        local Entry = State.DeletedMapItems[Index]
+
+        if
+            Entry and
+            Entry.Object and
+            Entry.Object.Parent and
+            Entry.Parent and
+            Entry.Parent.Parent then
+
+            pcall(function()
+                Entry.Object.Parent = Entry.Parent
+            end)
+        end
+
+        State.DeletedMapItems[Index] = nil
+
+        if Index % 150 == 0 then
+            task.wait()
+        end
+    end
+
+    if State.DeleteMapCache then
+        pcall(function()
+            State.DeleteMapCache:Destroy()
+        end)
+
+        State.DeleteMapCache = nil
+    end
+end
+
+local function ApplyDeleteMap()
+    if State.DeleteMapBusy then
+        return
+    end
+
+    RestoreDeleteMap()
+
+    local Maps = Workspace:FindFirstChild("Maps")
+    if not Maps then
+        Notify("Delete Map", "ไม่พบ Workspace.Maps")
+        return
+    end
+
+    local Army = Maps:FindFirstChild(DELETE_MAP_ARMY_NAME)
+
+    local Cache = Instance.new("Folder")
+    Cache.Name = "RCA_DeletedMapCache"
+    Cache.Parent = ReplicatedStorage
+
+    State.DeleteMapCache = Cache
+    State.DeleteMapBusy = true
+    State.DeleteMapToken += 1
+
+    local Token = State.DeleteMapToken
+    local Candidates = {}
+
+    for _, Object in ipairs(Maps:GetDescendants()) do
+        if
+            Object:IsA("BasePart") and
+            not KeepMapPart(Object, Maps, Army) then
+
+            -- ถ้ามี BasePart ancestor ที่จะถูกย้ายอยู่แล้ว
+            -- ไม่ต้องย้าย child ซ้ำ
+            local Parent = Object.Parent
+            local Nested = false
+
+            while Parent and Parent ~= Maps do
+                if
+                    Parent:IsA("BasePart") and
+                    not KeepMapPart(Parent, Maps, Army) then
+
+                    Nested = true
+                    break
+                end
+
+                Parent = Parent.Parent
+            end
+
+            if not Nested then
+                table.insert(Candidates, Object)
+            end
+        end
+    end
+
+    task.spawn(function()
+        local Removed = 0
+
+        for Index, Object in ipairs(Candidates) do
+            if
+                not State.Alive or
+                Token ~= State.DeleteMapToken or
+                not Options.DeleteMap.Value then
+
+                break
+            end
+
+            if
+                Object and
+                Object.Parent and
+                Object:IsDescendantOf(Maps) then
+
+                local Parent = Object.Parent
+
+                table.insert(
+                    State.DeletedMapItems,
+                    {
+                        Object = Object,
+                        Parent = Parent
+                    }
+                )
+
+                pcall(function()
+                    Object.Parent = Cache
+                end)
+
+                Removed += 1
+            end
+
+            if Index % 120 == 0 then
+                task.wait()
+            end
+        end
+
+        State.DeleteMapBusy = false
+
+        if
+            Options.DeleteMap.Value and
+            Token == State.DeleteMapToken then
+
+            Notify(
+                "Delete Map",
+                "ลดแมพแล้ว " .. tostring(Removed) .. " parts"
+            )
+        end
+    end)
+end
+
+local DeleteMapToggle = Tabs.Misc:AddToggle("DeleteMap", {
+    Title = "Delete Map",
+    Description = "ซ่อน/ย้ายส่วนแมพที่ไม่จำเป็น แต่เก็บ NPC, พื้น, ร้าน, จุดฟาร์ม และตึก Auto Dress",
+    Default = false
+})
+
+DeleteMapToggle:OnChanged(function()
+    if Options.DeleteMap.Value then
+        ApplyDeleteMap()
+    else
+        task.spawn(RestoreDeleteMap)
+    end
+end)
+end
+
 --// MISC TAB - CAMERA
 Tabs.Misc:AddSection("Camera")
 
@@ -2639,8 +4827,17 @@ local NoGunZoomToggle = Tabs.Misc:AddToggle("NoGunZoom", {
 })
 
 NoGunZoomToggle:OnChanged(function()
+    pcall(function()
+        RunService:UnbindFromRenderStep(NO_ZOOM_BIND)
+    end)
+
     if Options.NoGunZoom.Value then
         ApplyNoGunZoom()
+        RunService:BindToRenderStep(
+            NO_ZOOM_BIND,
+            Enum.RenderPriority.Camera.Value + 10,
+            ApplyNoGunZoom
+        )
     else
         if GetEquippedGun() then
             LocalPlayer.CameraMaxZoomDistance = 0.5
@@ -2650,51 +4847,164 @@ NoGunZoomToggle:OnChanged(function()
     end
 end)
 
-RunService:BindToRenderStep(
-    NO_ZOOM_BIND,
-    Enum.RenderPriority.Camera.Value + 10,
-    ApplyNoGunZoom
-)
-
 --// MISC TAB - AUTO DRESS
+do
 Tabs.Misc:AddSection("Auto Dress")
 
-local DRESS_TP_WAIT = 0.08
-local DRESS_STEP_WAIT = 0.12
+local DRESS_PROMPT_TIMEOUT = 1.25
+local DRESS_READY_STABLE = 0.14
+local DRESS_APPLY_WAIT = 0.22
+local DRESS_CLICK_WAIT = 0.20
+local DRESS_RETURN_CF = CFrame.new(-2716, -43, 3362)
 
-local function DressTP(Target, Offset)
-    local CF = GetInstanceCFrame(Target)
-    if not CF then return false end
+local function GetDressBase()
+    local Maps = Workspace:FindFirstChild("Maps")
+    local TargetMap =
+        Maps and
+        Maps:FindFirstChild(
+            "\224\184\149\224\184\182\224\184\129\224\184\129\224\184\173\224\184\135\224\184\151\224\184\177\224\184\158\224\184\154\224\184\129"
+        )
 
-    Teleport(CF * (Offset or CFrame.new(0, 1.5, 0)))
-    task.wait(DRESS_TP_WAIT)
-    return true
+    return
+        TargetMap and
+        TargetMap:FindFirstChild("Model") and
+        TargetMap.Model:FindFirstChild("Model")
 end
 
-local function FastPrompt(Prompt)
-    if not Prompt then return false end
+local function GetPromptWorldCFrame(Prompt)
+    if not Prompt then return nil end
 
-    if fireproximityprompt then
-        local OK = pcall(function()
-            fireproximityprompt(Prompt)
-        end)
+    local Parent = Prompt.Parent
+    if not Parent then return nil end
 
-        if OK then
-            return true
-        end
+    if Parent:IsA("Attachment") then
+        return Parent.WorldCFrame
     end
 
-    return false
+    if Parent:IsA("BasePart") then
+        return Parent.CFrame
+    end
+
+    if Parent:IsA("Model") then
+        return Parent:GetPivot()
+    end
+
+    local Part = Parent:FindFirstChildWhichIsA("BasePart", true)
+    return Part and Part.CFrame or nil
 end
 
-local function RealEPrompt(Prompt)
-    if not Prompt then return false end
+local function WaitDressPromptShown(Prompt, Offset, Timeout)
+    if not Prompt or not Prompt.Parent then
+        return false
+    end
 
-    -- Prompt ตัว Red KG ต้องเข้าใกล้แล้วกด E จริง
-    local Hold = math.max(
-        0.28,
-        tonumber(Prompt.HoldDuration) or 0
+    local Shown = false
+    local Ready = false
+    local InRangeSince = nil
+
+    local Connection =
+        ProximityPromptService.PromptShown:Connect(
+            function(CurrentPrompt)
+                if CurrentPrompt == Prompt then
+                    Shown = true
+                end
+            end
+        )
+
+    local CF = GetPromptWorldCFrame(Prompt)
+
+    if not CF then
+        Connection:Disconnect()
+        return false
+    end
+
+    Teleport(
+        CF *
+        (
+            Offset or
+            CFrame.new(0, 0, -1.8)
+        )
     )
+
+    local Started = os.clock()
+    Timeout = Timeout or DRESS_PROMPT_TIMEOUT
+
+    repeat
+        if Shown then
+            Ready = true
+            break
+        end
+
+        local HRP = Root()
+        local PromptCF = GetPromptWorldCFrame(Prompt)
+
+        if
+            HRP and
+            PromptCF and
+            Prompt.Enabled then
+
+            local MaxDistance =
+                math.max(
+                    1,
+                    tonumber(Prompt.MaxActivationDistance) or 10
+                )
+
+            local Distance =
+                (HRP.Position - PromptCF.Position).Magnitude
+
+            if Distance <= MaxDistance - 0.15 then
+                if not InRangeSince then
+                    InRangeSince = os.clock()
+                elseif
+                    os.clock() - InRangeSince >=
+                    DRESS_READY_STABLE then
+
+                    -- fallback เผื่อ Custom Prompt ไม่ส่ง PromptShown
+                    Ready = true
+                    break
+                end
+            else
+                InRangeSince = nil
+            end
+        end
+
+        task.wait(0.03)
+    until os.clock() - Started >= Timeout
+
+    Connection:Disconnect()
+
+    -- ให้ GUI/Highlight ของ Prompt มีเวลา render อีก 1 frame
+    task.wait(0.05)
+
+    return Ready or Shown
+end
+
+local function FireDressPrompt(Prompt)
+    if not Prompt or not fireproximityprompt then
+        return false
+    end
+
+    local OK = pcall(function()
+        fireproximityprompt(Prompt)
+    end)
+
+    if OK then
+        task.wait(DRESS_APPLY_WAIT)
+    end
+
+    return OK
+end
+
+local function RealEDressPrompt(Prompt)
+    if not Prompt then
+        return false
+    end
+
+    local Hold =
+        math.max(
+            0.28,
+            tonumber(Prompt.HoldDuration) or 0
+        )
 
     local OK = pcall(function()
         VirtualInputManager:SendKeyEvent(
@@ -2704,7 +5014,7 @@ local function RealEPrompt(Prompt)
             game
         )
 
-        task.wait(Hold + 0.03)
+        task.wait(Hold + 0.05)
 
         VirtualInputManager:SendKeyEvent(
             false,
@@ -2714,146 +5024,154 @@ local function RealEPrompt(Prompt)
         )
     end)
 
+    if OK then
+        task.wait(DRESS_APPLY_WAIT)
+    end
+
+    return OK
+end
+
+local function DressPromptStep(Prompt, Offset, UseRealE)
+    if not Prompt then
+        return false
+    end
+
+    WaitDressPromptShown(
+        Prompt,
+        Offset,
+        DRESS_PROMPT_TIMEOUT
+    )
+
+    if UseRealE then
+        return RealEDressPrompt(Prompt)
+    end
+
+    return FireDressPrompt(Prompt)
+end
+
+local function DressClickStep(ClickDetector)
+    if not ClickDetector or not ClickDetector.Parent then
+        return false
+    end
+
+    local CF = GetInstanceCFrame(ClickDetector.Parent)
+    if not CF then return false end
+
+    Teleport(CF * CFrame.new(0, 1.3, 0))
+    task.wait(DRESS_READY_STABLE)
+
+    if not fireclickdetector then
+        return false
+    end
+
+    local OK = pcall(function()
+        fireclickdetector(ClickDetector)
+    end)
+
+    if OK then
+        task.wait(DRESS_CLICK_WAIT)
+    end
+
     return OK
 end
 
 Tabs.Misc:AddButton({
-    Title = "Auto Dress",
-    Description = "ใส่ชุดทั้งหมดแบบเร็ว + Red KG ใช้ E จริง",
+    Title = "Auto dress พลทหาร",
+    Description = "วาปทีละชิ้น รอ Prompt/Highlight ขึ้นก่อนค่อยใส่อันต่อไป",
     Callback = function()
         task.spawn(function()
-            local Maps = Workspace:FindFirstChild("Maps")
-            local TargetMap =
-                Maps and
-                Maps:FindFirstChild(
-                    "\224\184\149\224\184\182\224\184\129\224\184\129\224\184\173\224\184\135\224\184\151\224\184\177\224\184\158\224\184\154\224\184\129"
-                )
-
-            local Base =
-                TargetMap and
-                TargetMap:FindFirstChild("Model") and
-                TargetMap.Model:FindFirstChild("Model")
+            local Base = GetDressBase()
 
             if not Base then
                 Notify(
-                    "Auto Dress",
-                    "ไม่พบโฟลเดอร์แผนที่แต่งตัว"
+                    "Auto dress พลทหาร",
+                    "ไม่พบตึกกองทัพบก"
                 )
                 return
             end
 
-            -- 1. ArmBand01
+            -- 1) ArmBand01
             pcall(function()
                 local C5 = Base:GetChildren()[5]
-                local Arm =
+                local Prompt =
                     C5 and
-                    C5.ArmBand01[" Armband"].Arm1["Right Arm"]
+                    C5:FindFirstChild("ArmBand01") and
+                    C5.ArmBand01:FindFirstChild(" Armband") and
+                    C5.ArmBand01[" Armband"]:FindFirstChild("Arm1") and
+                    C5.ArmBand01[" Armband"].Arm1:FindFirstChild("Right Arm") and
+                    C5.ArmBand01[" Armband"].Arm1["Right Arm"]:FindFirstChild("ProximityPrompt")
 
-                if DressTP(Arm) then
-                    FastPrompt(
-                        Arm:FindFirstChildOfClass("ProximityPrompt") or
-                        Arm:FindFirstChild("ProximityPrompt")
-                    )
-                end
+                DressPromptStep(Prompt)
             end)
 
-            task.wait(DRESS_STEP_WAIT)
-
-            -- 2. Red KG
-            -- fireproximityprompt() ตัวนี้ไม่ผ่าน แต่ E จริงผ่าน
+            -- 2) Red KG พลทหาร
             pcall(function()
                 local C7 = Base:GetChildren()[7]
-                local RedKG =
+                local FirstModel =
                     C7 and
-                    C7:FindFirstChild("Model") and
-                    C7.Model:FindFirstChild("Red KG")
+                    C7:GetChildren()[1]
+
+                local RedKG =
+                    FirstModel and
+                    FirstModel:FindFirstChild("Red KG")
 
                 local Prompt =
                     RedKG and
-                    (
-                        RedKG:FindFirstChildOfClass("ProximityPrompt") or
-                        RedKG:FindFirstChild("ProximityPrompt")
-                    )
+                    RedKG:FindFirstChild("ProximityPrompt")
 
-                if
-                    RedKG and
-                    DressTP(
-                        RedKG,
-                        CFrame.new(0, 0, -2)
-                    ) then
-
-                    RealEPrompt(Prompt)
-                end
+                DressPromptStep(
+                    Prompt,
+                    CFrame.new(0, 0, -2),
+                    true
+                )
             end)
 
-            task.wait(DRESS_STEP_WAIT)
-
-            -- 3. Hat
+            -- 3) Hat/Giver
             pcall(function()
                 local C33 = Base:GetChildren()[33]
-                local Hat =
+                local Child3 =
                     C33 and
-                    C33:GetChildren()[4] and
-                    C33:GetChildren()[4]:FindFirstChild(
-                        "Hat For Sergeant to First Sergeant"
-                    )
+                    C33:GetChildren()[3]
 
-                if DressTP(Hat) then
-                    local Giver =
-                        C33 and
-                        C33:GetChildren()[3] and
-                        C33:GetChildren()[3]:FindFirstChild("Giver")
+                local Giver =
+                    Child3 and
+                    Child3:FindFirstChild("Giver")
 
-                    FastPrompt(
-                        Giver and
-                        (
-                            Giver:FindFirstChildOfClass("ProximityPrompt") or
-                            Giver:FindFirstChild("ProximityPrompt")
-                        )
-                    )
-                end
+                local Prompt =
+                    Giver and
+                    Giver:FindFirstChild("ProximityPrompt")
+
+                DressPromptStep(Prompt)
             end)
 
-            task.wait(DRESS_STEP_WAIT)
-
-            -- 4. Webbing2
+            -- 4) Webbing2
             pcall(function()
-                local Webbing = Base:FindFirstChild("Webbing2")
+                local Webbing =
+                    Base:FindFirstChild("Webbing2")
 
-                if DressTP(Webbing) then
-                    local CD =
-                        Webbing and
-                        (
-                            Webbing:FindFirstChildOfClass("ClickDetector") or
-                            Webbing:FindFirstChild("ClickDetector")
-                        )
-
-                    if CD and fireclickdetector then
-                        fireclickdetector(CD)
-                    end
-                end
-            end)
-
-            task.wait(DRESS_STEP_WAIT)
-
-            -- 5. Model 79
-            pcall(function()
-                local Item79 = Base:GetChildren()[79]
-
-                if DressTP(Item79) then
-                    FastPrompt(
-                        Item79 and
-                        (
-                            Item79:FindFirstChildOfClass("ProximityPrompt") or
-                            Item79:FindFirstChild("ProximityPrompt")
-                        )
+                local CD =
+                    Webbing and
+                    (
+                        Webbing:FindFirstChildOfClass("ClickDetector") or
+                        Webbing:FindFirstChild("ClickDetector")
                     )
-                end
+
+                DressClickStep(CD)
             end)
 
-            task.wait(DRESS_STEP_WAIT)
+            -- 5) Helmet / Model 79
+            pcall(function()
+                local Item79 =
+                    Base:GetChildren()[79]
 
-            -- 6. Headset
+                local Prompt =
+                    Item79 and
+                    Item79:FindFirstChild("ProximityPrompt")
+
+                DressPromptStep(Prompt)
+            end)
+
+            -- 6) Headset
             pcall(function()
                 local HeadsetModel =
                     Base:FindFirstChild(
@@ -2864,25 +5182,146 @@ Tabs.Misc:AddButton({
                     HeadsetModel and
                     HeadsetModel:FindFirstChild("Headset")
 
-                if DressTP(Headset) then
-                    FastPrompt(
-                        Headset and
-                        (
-                            Headset:FindFirstChildOfClass("ProximityPrompt") or
-                            Headset:FindFirstChild("ProximityPrompt")
-                        )
-                    )
-                end
+                local Prompt =
+                    Headset and
+                    Headset:FindFirstChild("ProximityPrompt")
+
+                DressPromptStep(Prompt)
             end)
 
-            task.wait(0.1)
-
-            -- กลับจุดเดิมของ Auto Dress
-            Teleport(CFrame.new(-2716, -43, 3362))
-            Notify("Auto Dress", "Done!")
+            Teleport(DRESS_RETURN_CF)
+            Notify("Auto dress พลทหาร", "ใส่ชุดเสร็จแล้ว")
         end)
     end
 })
+
+Tabs.Misc:AddButton({
+    Title = "Auto dress ร้อยเอก",
+    Description = "ArmBand09 → Armor → Giver → Peaked cap → Red KG",
+    Callback = function()
+        task.spawn(function()
+            local Base = GetDressBase()
+
+            if not Base then
+                Notify(
+                    "Auto dress ร้อยเอก",
+                    "ไม่พบตึกกองทัพบก"
+                )
+                return
+            end
+
+            -- 1) ArmBand09
+            pcall(function()
+                local C5 = Base:GetChildren()[5]
+                local ArmBand09 =
+                    C5 and
+                    C5:FindFirstChild("ArmBand09")
+
+                local Prompt =
+                    ArmBand09 and
+                    ArmBand09:FindFirstChild(" Armband") and
+                    ArmBand09[" Armband"]:FindFirstChild("Arm1") and
+                    ArmBand09[" Armband"].Arm1:FindFirstChild("Right Arm") and
+                    ArmBand09[" Armband"].Arm1["Right Arm"]:FindFirstChild("ProximityPrompt")
+
+                DressPromptStep(Prompt)
+            end)
+
+            -- 2) Armor.Torso
+            pcall(function()
+                local C4 = Base:GetChildren()[4]
+                local Armor =
+                    C4 and
+                    C4:FindFirstChild("Armor")
+
+                local Torso =
+                    Armor and
+                    Armor:FindFirstChild("Torso")
+
+                local Prompt =
+                    Torso and
+                    Torso:FindFirstChild("ProximityPrompt")
+
+                DressPromptStep(Prompt)
+            end)
+
+            -- 3) GetChildren()[33]:GetChildren()[3].Giver
+            pcall(function()
+                local C33 = Base:GetChildren()[33]
+                local Child3 =
+                    C33 and
+                    C33:GetChildren()[3]
+
+                local Giver =
+                    Child3 and
+                    Child3:FindFirstChild("Giver")
+
+                local Prompt =
+                    Giver and
+                    Giver:FindFirstChild("ProximityPrompt")
+
+                DressPromptStep(Prompt)
+            end)
+
+            -- 4) Peaked caps by nonny
+            pcall(function()
+                local C27 = Base:GetChildren()[27]
+                local Part =
+                    C27 and
+                    C27:FindFirstChild("Part")
+
+                local Model1 =
+                    Part and
+                    Part:FindFirstChild("Model")
+
+                local Model2 =
+                    Model1 and
+                    Model1:FindFirstChild("Model")
+
+                local Cap =
+                    Model2 and
+                    Model2:FindFirstChild("Peaked caps by nonny")
+
+                local Face =
+                    Cap and
+                    Cap:FindFirstChild("Face")
+
+                local Prompt =
+                    Face and
+                    Face:FindFirstChild("ProximityPrompt")
+
+                DressPromptStep(Prompt)
+            end)
+
+            -- 5) Red KG ร้อยเอก
+            -- จุดนี้ต้องกด E จริง
+            pcall(function()
+                local C7 = Base:GetChildren()[7]
+                local SecondModel =
+                    C7 and
+                    C7:GetChildren()[2]
+
+                local RedKG =
+                    SecondModel and
+                    SecondModel:FindFirstChild("Red KG")
+
+                local Prompt =
+                    RedKG and
+                    RedKG:FindFirstChild("ProximityPrompt")
+
+                DressPromptStep(
+                    Prompt,
+                    CFrame.new(0, 0, -2),
+                    true
+                )
+            end)
+
+            Teleport(DRESS_RETURN_CF)
+            Notify("Auto dress ร้อยเอก", "ใส่ชุดเสร็จแล้ว")
+        end)
+    end
+})
+end
 
 --// MISC TAB - PLAYER MANAGER
 Tabs.Misc:AddSection("Player Manager")
@@ -2902,7 +5341,7 @@ end
 
 local PlayerDropdown = Tabs.Misc:AddDropdown("SelectedPlayer", {
     Title = "Select Player",
-    Values = GetPlayerNames(),
+    Values = {},
     Multi = false,
     Searchable = true
 })
@@ -2918,18 +5357,8 @@ local function RefreshPlayers()
     end
 end
 
-Connect(Players.PlayerAdded, function()
-    task.wait(0.3)
-    RefreshPlayers()
-end)
-
-Connect(Players.PlayerRemoving, function()
-    task.wait(0.3)
-    RefreshPlayers()
-end)
-
 Tabs.Misc:AddButton({
-    Title = "Refresh Players",
+    Title = "Load / Refresh Players",
     Callback = function()
         RefreshPlayers()
         Notify("Player List", "Updated")
@@ -3188,28 +5617,27 @@ local function OnCharacterAdded(Char)
     StopUndergroundFarm()
 
     task.wait(0.5)
-    UpdateCharParts()
 
     local Hum = Humanoid()
-    if Hum then
+    if Hum and State.WalkSpeed ~= 16 then
         Hum.WalkSpeed = State.WalkSpeed
-        Hum:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
-            if Hum.WalkSpeed ~= State.WalkSpeed then
-                Hum.WalkSpeed = State.WalkSpeed
-            end
-        end)
+    end
+
+    if Options.Noclip.Value then
+        UpdateCharParts()
     end
 
     if Options.Fly.Value then StartFly() end
+    UpdateMovementRuntime()
+    UpdateUndergroundRuntime()
     if Options.NoGunZoom.Value then task.defer(ApplyNoGunZoom) end
+    if Options.AntiVoid and Options.AntiVoid.Value then
+        task.defer(StartAntiVoid)
+    end
 
     if Options.AutoFishing and Options.AutoFishing.Value then
         task.delay(0.8, StartAutoFishing)
     end
-end
-
-if LocalPlayer.Character then
-    UpdateCharParts()
 end
 
 Connect(LocalPlayer.CharacterAdded, OnCharacterAdded)
@@ -3226,8 +5654,13 @@ local function Cleanup()
     end
 
     State.FishingAutoToken += 1
+    DisconnectAutoBaitConnection()
     StopFishingVisualLock()
     SetFishingHold(false)
+
+    if State.RestoreFishingLowFX then
+        State.RestoreFishingLowFX()
+    end
 
     if FishingAction then
         pcall(function()
@@ -3236,10 +5669,19 @@ local function Cleanup()
         end)
     end
 
-    StopUndergroundFarm()
+    State.AutoFarmLoopToken += 1
+    State.FishingLoopToken += 1
+    State.CraftLoopToken += 1
+    State.ESPLoopToken += 1
+
+    StopUndergroundRuntime()
+    StopMovementRuntime()
+    StopNoclipRuntime()
+    StopESPRuntime()
     StopMoving()
     StopFly()
-    RestoreNoclip()
+    StopAntiVoid()
+    RestoreDeleteMap()
 
     pcall(function()
         RunService:UnbindFromRenderStep(NO_ZOOM_BIND)
@@ -3280,6 +5722,7 @@ InterfaceManager:BuildInterfaceSection(Tabs.Settings)
 SaveManager:BuildConfigSection(Tabs.Settings)
 
 Window:SelectTab(1)
-SaveManager:LoadAutoloadConfig()
 
-Notify("จำลองชีวิตทหารไทย [RCA]", "made by BatmanScript")
+-- Cold start: ไม่เปิด toggle จาก config เก่าอัตโนมัติ
+-- Config ยังอยู่ใน Settings และกด Load เองได้ตามปกติ
+Notify("จำลองชีวิตทหารไทย [RCA]", "Cold Start - ไม่มีระบบหนักทำงานจนกว่าจะเปิด")
